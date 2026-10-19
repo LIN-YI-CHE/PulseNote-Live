@@ -1,0 +1,6 @@
+{
+  "name": "PulseNote Live — Gemini 3.8 Live 會議工作台",
+  "description": "串接 Gemini 3.8 Live 模型的即時語音會議工作台，邊聽邊生成結構化會議紀錄、互動心智圖與待辦事項。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
