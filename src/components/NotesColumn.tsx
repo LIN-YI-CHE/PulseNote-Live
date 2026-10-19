@@ -20,6 +20,7 @@ interface NotesColumnProps {
   onUpdateNotes: (notes: NoteSection[]) => void;
   onSendManualUtterance: (speaker: string, text: string) => void;
   onNudgeSync: () => void;
+  onOpenCatchUpModal?: () => void;
 }
 
 export const NotesColumn: React.FC<NotesColumnProps> = ({
@@ -30,6 +31,7 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
   onUpdateNotes,
   onSendManualUtterance,
   onNudgeSync,
+  onOpenCatchUpModal,
 }) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTopic, setEditTopic] = useState('');
@@ -127,13 +129,23 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
+            {onOpenCatchUpModal && (
+              <button
+                onClick={onOpenCatchUpModal}
+                className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-purple-700 bg-purple-50 hover:bg-purple-100 rounded transition-colors whitespace-nowrap shrink-0"
+                title="貼上或口述會議要點，讓 Gemini 立即補全/重構整場會議"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>速記補全</span>
+              </button>
+            )}
             {isLiveConnected && (
               <button
                 onClick={onNudgeSync}
                 className="px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors whitespace-nowrap shrink-0"
                 title="要求 Gemini 3.8 Live 立即根據最新對話整理結構"
               >
-                立即歸納重點
+                立即歸納
               </button>
             )}
             <button

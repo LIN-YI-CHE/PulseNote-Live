@@ -43,10 +43,20 @@ export interface MeetingSession {
   notes: NoteSection[];
   mindMapNodes: MindMapNode[];
   todos: TodoItem[];
+  backupAudioBlobUrl?: string;
+  hasLocalBackup?: boolean;
 }
 
 export interface LiveToolSyncPayload {
   toolName: 'syncMeetingNotes' | 'syncMindMapNodes' | 'syncTodoItems';
   args: any;
   timestamp: string;
+}
+
+export interface ToolCallInspectorItem {
+  id: string;
+  toolName: string;
+  timestamp: string;
+  args: any;
+  callId?: string;
 }

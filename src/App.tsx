@@ -10,14 +10,21 @@ import {
   Edit3,
   Check,
   AlertCircle,
-  RefreshCw,
   VolumeX,
+  Download,
+  Code2,
+  Sparkles,
+  Upload,
+  X,
+  ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
 import {
   MeetingSession,
   MindMapNode,
   NoteSection,
   TodoItem,
+  ToolCallInspectorItem,
 } from './types/meeting';
 import {
   INITIAL_MEETING_SESSIONS,
@@ -60,7 +67,7 @@ export default function App() {
         }
       }
     } catch {
-      // fallback to default
+      // fallback
     }
     return INITIAL_MEETING_SESSIONS;
   });
@@ -69,6 +76,13 @@ export default function App() {
     () => sessions[0]?.id || INITIAL_MEETING_SESSIONS[0].id
   );
   const [showHistoryDrawer, setShowHistoryDrawer] = useState<boolean>(false);
+  const [showInspectorDrawer, setShowInspectorDrawer] = useState<boolean>(false);
+  const [showCatchUpModal, setShowCatchUpModal] = useState<boolean>(false);
+
+  // Catch-up / Reconstruction modal state
+  const [catchUpText, setCatchUpText] = useState<string>('');
+  const [isCatchingUp, setIsCatchingUp] = useState<boolean>(false);
+  const [catchUpError, setCatchUpError] = useState<string | null>(null);
 
   // Title inline editing
   const [isEditingTitle, setIsEditingTitle] = useState<boolean>(false);
@@ -84,9 +98,17 @@ export default function App() {
   const [micLevel, setMicLevel] = useState<number>(0);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [lastToolSyncInfo, setLastToolSyncInfo] = useState<string>(
-    '就緒 · 等待即時語音或測試對話'
+    '就緒 · 支援長會議無縫滾動連線'
   );
   const [simStepIndex, setSimStepIndex] = useState<number>(0);
+
+  // Local Audio Backup via MediaRecorder (Safety net for 60+ min meetings)
+  const [backupAudioUrl, setBackupAudioUrl] = useState<string | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+
+  // Inspector Logs for Gemini 3.8 Live Tool Calls
+  const [inspectorLogs, setInspectorLogs] = useState<ToolCallInspectorItem[]>([]);
 
   // Refs for callbacks to avoid stale closures (per Live API Rules)
   const wsRef = useRef<WebSocket | null>(null);
@@ -96,10 +118,15 @@ export default function App() {
   const activeSessionIdRef = useRef<string>(activeSessionId);
   const partialBufferRef = useRef<string>('');
   const timerRef = useRef<number | null>(null);
+  const isRecordingRef = useRef<boolean>(false);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    isRecordingRef.current = isLiveRecording;
+  }, [isLiveRecording]);
 
   // Persist to localStorage
   useEffect(() => {
@@ -126,7 +153,7 @@ export default function App() {
           s.id === targetId
             ? {
                 ...updater(s),
-                updatedAt: `2026-10-18 ${nowStr}`,
+                updatedAt: `2026-10-19 ${nowStr}`,
               }
             : s
         )
@@ -137,8 +164,20 @@ export default function App() {
 
   // Merge tool call payloads from Gemini 3.8 Live into active session state
   const handleLiveToolCall = useCallback(
-    (toolName: string, args: any, timestamp: string) => {
+    (toolName: string, args: any, timestamp: string, callId?: string) => {
       if (!args) return;
+
+      // Log to Inspector
+      setInspectorLogs((prev) => [
+        {
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          toolName,
+          timestamp,
+          args,
+          callId,
+        },
+        ...prev.slice(0, 49),
+      ]);
 
       if (toolName === 'syncMeetingNotes' && Array.isArray(args.sections)) {
         updateActiveSession((prev) => {
@@ -165,7 +204,7 @@ export default function App() {
           }
           return { ...prev, notes: merged };
         });
-        setLastToolSyncInfo(`已同步會議紀錄 (${timestamp})`);
+        setLastToolSyncInfo(`已同步重點摘要 (${timestamp})`);
       }
 
       if (toolName === 'syncMindMapNodes' && Array.isArray(args.nodes)) {
@@ -193,7 +232,7 @@ export default function App() {
           }
           return { ...prev, mindMapNodes: merged };
         });
-        setLastToolSyncInfo(`已擴展心智圖節點 (${timestamp})`);
+        setLastToolSyncInfo(`已更新三層心智圖 (${timestamp})`);
       }
 
       if (toolName === 'syncTodoItems' && Array.isArray(args.todos)) {
@@ -236,13 +275,13 @@ export default function App() {
           }
           return { ...prev, todos: merged };
         });
-        setLastToolSyncInfo(`已更新待辦事項 (${timestamp})`);
+        setLastToolSyncInfo(`已萃取待辦事項 (${timestamp})`);
       }
     },
     [updateActiveSession]
   );
 
-  // Ensure WebSocket connection to /ws/live
+  // Ensure WebSocket connection with keepalive ping-pong and auto-reconnect
   const ensureLiveWebSocket = useCallback((): Promise<WebSocket> => {
     return new Promise((resolve, reject) => {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -265,10 +304,24 @@ export default function App() {
         try {
           const msg = JSON.parse(event.data);
 
+          // Handle server ping keepalive
+          if (msg.type === 'ping') {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'pong' }));
+            }
+            return;
+          }
+
           if (msg.type === 'session_status' && msg.status === 'connected') {
             setWsStatus('connected');
-            setLastToolSyncInfo('Gemini 3.8 Live 已連線 · 傾聽中');
+            setLastToolSyncInfo(
+              msg.rolloverCount
+                ? `連線已平滑延續 (第 ${msg.rolloverCount + 1} 階段)`
+                : 'Gemini 3.8 Live 已連線 · 傾聽中'
+            );
             resolve(ws);
+          } else if (msg.type === 'session_rollover') {
+            setLastToolSyncInfo(msg.message || '連線自動無縫延續中...');
           } else if (msg.type === 'input_transcription' && msg.text) {
             partialBufferRef.current += msg.text;
             setLivePartialTranscript(partialBufferRef.current);
@@ -298,7 +351,12 @@ export default function App() {
               setLivePartialTranscript('');
             }
           } else if (msg.type === 'tool_call') {
-            handleLiveToolCall(msg.toolName, msg.args, msg.timestamp);
+            handleLiveToolCall(
+              msg.toolName,
+              msg.args,
+              msg.timestamp,
+              msg.callId
+            );
           } else if (msg.type === 'error') {
             setErrorBanner(msg.message);
           }
@@ -308,27 +366,44 @@ export default function App() {
       };
 
       ws.onerror = () => {
-        setErrorBanner('WebSocket 連線發生錯誤，請稍後重試。');
         setWsStatus('disconnected');
         reject(new Error('WebSocket error'));
       };
 
       ws.onclose = () => {
         setWsStatus('disconnected');
+        // Auto-reconnect if user is still actively recording!
+        if (isRecordingRef.current) {
+          setLastToolSyncInfo('連線中斷，正在自動重新連線（麥克風持續錄音備份中）...');
+          setTimeout(() => {
+            if (isRecordingRef.current) {
+              ensureLiveWebSocket().catch(() => {});
+            }
+          }, 1500);
+        }
       };
     });
   }, [handleLiveToolCall, updateActiveSession]);
 
-  // Start / Stop Live Microphone Audio Capture (16kHz PCM)
+  // Start / Stop Live Microphone Audio Capture (with local MediaRecorder safety net)
   const handleToggleLiveMic = async () => {
     if (isLiveRecording) {
       // Stop recording
       setIsLiveRecording(false);
+      isRecordingRef.current = false;
       setMicLevel(0);
 
       if (timerRef.current) {
         window.clearInterval(timerRef.current);
         timerRef.current = null;
+      }
+
+      // Stop MediaRecorder and build downloadable local backup audio
+      if (
+        mediaRecorderRef.current &&
+        mediaRecorderRef.current.state !== 'inactive'
+      ) {
+        mediaRecorderRef.current.stop();
       }
 
       if (processorRef.current) {
@@ -344,7 +419,7 @@ export default function App() {
         audioCtxRef.current = null;
       }
 
-      // Flush any remaining partial transcript and nudge final structure sync
+      // Flush remaining transcript and nudge final sync
       if (partialBufferRef.current.trim()) {
         const leftover = partialBufferRef.current.trim();
         const nowTime = new Date().toLocaleTimeString('zh-TW', {
@@ -389,8 +464,40 @@ export default function App() {
       });
       mediaStreamRef.current = stream;
 
+      // 1. Start browser-local backup recording via MediaRecorder
+      try {
+        const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : 'audio/webm';
+        const recorder = new MediaRecorder(stream, { mimeType: mime });
+        recordedChunksRef.current = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            recordedChunksRef.current.push(e.data);
+          }
+        };
+        recorder.onstop = () => {
+          if (recordedChunksRef.current.length > 0) {
+            const blob = new Blob(recordedChunksRef.current, { type: mime });
+            const url = URL.createObjectURL(blob);
+            setBackupAudioUrl(url);
+            updateActiveSession((prev) => ({
+              ...prev,
+              backupAudioBlobUrl: url,
+              hasLocalBackup: true,
+            }));
+          }
+        };
+        recorder.start(1000); // chunk every 1 sec
+        mediaRecorderRef.current = recorder;
+      } catch (recErr) {
+        console.warn('MediaRecorder not available or failed to start:', recErr);
+      }
+
+      // 2. Start WebSocket connection to Gemini 3.8 Live
       const ws = await ensureLiveWebSocket();
 
+      // 3. Start 16kHz PCM Web Audio processor
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
@@ -402,7 +509,6 @@ export default function App() {
 
       processor.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        // Calculate RMS level for visual meter
         let sum = 0;
         for (let i = 0; i < inputData.length; i++) {
           sum += inputData[i] * inputData[i];
@@ -417,6 +523,7 @@ export default function App() {
       };
 
       setIsLiveRecording(true);
+      isRecordingRef.current = true;
       timerRef.current = window.setInterval(() => {
         updateActiveSession((prev) => ({
           ...prev,
@@ -426,7 +533,7 @@ export default function App() {
     } catch (err: any) {
       console.error('Microphone access or Live connection error:', err);
       setErrorBanner(
-        '無法啟動麥克風收音（請確認瀏覽器麥克風權限），您仍可點擊「載入測試對話」體驗 Gemini 3.8 Live 即時整理功能。'
+        '無法啟動麥克風（請確認瀏覽器麥克風權限），您仍可點擊「注入測試對話」或「速記補全」體驗完整功能。'
       );
     }
   };
@@ -440,7 +547,6 @@ export default function App() {
       second: '2-digit',
     });
 
-    // Append immediately to transcript feed
     updateActiveSession((prev) => ({
       ...prev,
       transcripts: [
@@ -470,7 +576,6 @@ export default function App() {
     }
   };
 
-  // Trigger next simulated meeting turn
   const handleInjectSimulatedTurn = () => {
     const turn =
       SIMULATED_MEETING_SCRIPT[simStepIndex % SIMULATED_MEETING_SCRIPT.length];
@@ -480,8 +585,92 @@ export default function App() {
 
   const handleNudgeSync = () => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      setLastToolSyncInfo('正在要求 Gemini 3.8 Live 同步最新結構...');
+      setLastToolSyncInfo('要求 Gemini 3.8 Live 同步結構...');
       wsRef.current.send(JSON.stringify({ type: 'nudge_sync' }));
+    }
+  };
+
+  // Catch-up / Reconstruction handler using REST API /api/meeting/restructure
+  const handleExecuteCatchUp = async () => {
+    if (!catchUpText.trim()) return;
+    setIsCatchingUp(true);
+    setCatchUpError(null);
+
+    try {
+      const response = await fetch('/api/meeting/restructure', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meetingTitle: activeSession.title,
+          textContext: catchUpText.trim(),
+          existingNotes: activeSession.notes,
+          existingMindMap: activeSession.mindMapNodes,
+          existingTodos: activeSession.todos,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok || !resData.success) {
+        throw new Error(resData.error || '整理失敗');
+      }
+
+      const { sections, mindMapNodes, todos } = resData.data;
+
+      updateActiveSession((prev) => {
+        // Append or replace notes
+        const nowTime = new Date().toLocaleTimeString('zh-TW', {
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+        const formattedNotes: NoteSection[] = Array.isArray(sections)
+          ? sections.map((s: any, idx: number) => ({
+              id: s.id || `topic-catchup-${idx}`,
+              topic: s.topic,
+              summary: s.summary,
+              keyDecisions: s.keyDecisions || [],
+              updatedAt: nowTime,
+            }))
+          : prev.notes;
+
+        const formattedNodes: MindMapNode[] = Array.isArray(mindMapNodes)
+          ? mindMapNodes.map((n: any) => ({
+              id: n.id,
+              parentId: !n.parentId || n.parentId === 'NONE' ? null : n.parentId,
+              label: n.label,
+              category: n.category || 'topic',
+              notes: n.notes,
+            }))
+          : prev.mindMapNodes;
+
+        const formattedTodos: TodoItem[] = Array.isArray(todos)
+          ? todos.map((t: any, idx: number) => ({
+              id: t.id || `todo-catchup-${idx}`,
+              task: t.task,
+              assignee: t.assignee || '待指派',
+              priority: t.priority || 'medium',
+              dueDate: t.dueDate,
+              completed: false,
+              createdAt: nowTime,
+            }))
+          : prev.todos;
+
+        return {
+          ...prev,
+          notes: [...prev.notes, ...formattedNotes],
+          mindMapNodes: formattedNodes.length > 0 ? formattedNodes : prev.mindMapNodes,
+          todos: [...formattedTodos, ...prev.todos],
+        };
+      });
+
+      setShowCatchUpModal(false);
+      setCatchUpText('');
+      setLastToolSyncInfo('已成功補全會議紀錄、心智圖與待辦清單！');
+    } catch (err: any) {
+      console.error('Catch-up error:', err);
+      setCatchUpError(err?.message || '整理失敗，請稍後重試');
+    } finally {
+      setIsCatchingUp(false);
     }
   };
 
@@ -514,6 +703,7 @@ export default function App() {
     };
     setSessions((prev) => [newSession, ...prev]);
     setActiveSessionId(newId);
+    setBackupAudioUrl(null);
     setShowHistoryDrawer(false);
   };
 
@@ -553,6 +743,7 @@ export default function App() {
           onClick={(e) => {
             e.preventDefault();
             setShowHistoryDrawer(false);
+            setShowInspectorDrawer(false);
           }}
           className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 font-display"
         >
@@ -566,18 +757,33 @@ export default function App() {
             onClick={(e) => {
               e.preventDefault();
               setShowHistoryDrawer(false);
+              setShowInspectorDrawer(false);
             }}
             className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 ${
-              !showHistoryDrawer ? 'text-slate-900 font-semibold' : ''
+              !showHistoryDrawer && !showInspectorDrawer
+                ? 'text-slate-900 font-semibold'
+                : ''
             }`}
           >
             即時工作台
+          </a>
+          <a
+            href="#catchup"
+            onClick={(e) => {
+              e.preventDefault();
+              setShowCatchUpModal(true);
+            }}
+            className="text-purple-700 hover:text-purple-900 transition-colors whitespace-nowrap shrink-0 font-semibold flex items-center gap-1"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>速記補全重構</span>
           </a>
           <a
             href="#history"
             onClick={(e) => {
               e.preventDefault();
               setShowHistoryDrawer((prev) => !prev);
+              setShowInspectorDrawer(false);
             }}
             className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 ${
               showHistoryDrawer ? 'text-blue-600 font-semibold' : ''
@@ -586,14 +792,17 @@ export default function App() {
             會議歷史 ({sessions.length})
           </a>
           <a
-            href="#simulate"
+            href="#inspector"
             onClick={(e) => {
               e.preventDefault();
-              handleInjectSimulatedTurn();
+              setShowInspectorDrawer((prev) => !prev);
+              setShowHistoryDrawer(false);
             }}
-            className="hover:text-blue-600 transition-colors whitespace-nowrap shrink-0"
+            className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 ${
+              showInspectorDrawer ? 'text-blue-600 font-semibold' : ''
+            }`}
           >
-            載入測試對話
+            模型呼叫檢查器 ({inspectorLogs.length})
           </a>
           <a
             href="#export"
@@ -634,12 +843,12 @@ export default function App() {
 
       {/* Secondary Contextual Workspace Toolbar */}
       <div className="flex items-center justify-between gap-4 px-6 py-2 bg-slate-50 border-b border-slate-200 shrink-0">
-        {/* Left: Meeting Title & Breadcrumb */}
+        {/* Left: Meeting Title & Status */}
         <div className="flex items-center gap-2 min-w-0">
           <button
             onClick={() => setShowHistoryDrawer((prev) => !prev)}
             className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
-            title="切換或管理多場會議紀錄"
+            title="管理多場會議紀錄"
           >
             <FolderClock className="w-3.5 h-3.5" />
             <span>會議列表</span>
@@ -700,9 +909,9 @@ export default function App() {
           )}
         </div>
 
-        {/* Right: Live Session Telemetry & Simulation Controls */}
-        <div className="flex items-center gap-4 text-xs text-slate-600 shrink-0">
-          {/* Audio Level & Timer */}
+        {/* Right: Live Telemetry, Audio Backup & Quick Actions */}
+        <div className="flex items-center gap-3 text-xs text-slate-600 shrink-0">
+          {/* Recording Timer & Audio Meter */}
           <div className="flex items-center gap-2">
             <span className="text-slate-500 whitespace-nowrap">收音時長</span>
             <span className="font-mono-tabular font-semibold text-slate-900">
@@ -710,7 +919,7 @@ export default function App() {
             </span>
             {isLiveRecording && (
               <div
-                className="w-16 h-2 bg-slate-200 rounded-full overflow-hidden"
+                className="w-14 h-2 bg-slate-200 rounded-full overflow-hidden"
                 title="麥克風即時音量"
               >
                 <div
@@ -721,13 +930,30 @@ export default function App() {
             )}
           </div>
 
+          {/* Local Audio Backup Status & Download Button */}
+          {backupAudioUrl ? (
+            <a
+              href={backupAudioUrl}
+              download={`${activeSession.title.replace(/\s+/g, '_')}_本機錄音備份.webm`}
+              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors whitespace-nowrap shrink-0"
+              title="下載剛才在瀏覽器本機錄下的完整音訊檔"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>下載錄音備份 (WebM)</span>
+            </a>
+          ) : isLiveRecording ? (
+            <div className="flex items-center gap-1 text-[11px] text-emerald-700 font-medium">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>本機雙重備份中</span>
+            </div>
+          ) : null}
+
           <span className="text-slate-300" aria-hidden="true">
             ·
           </span>
 
-          {/* Gemini 3.8 Live Connection Status */}
+          {/* Live Session Status */}
           <div className="hidden lg:flex items-center gap-1.5 text-xs">
-            <VolumeX className="w-3.5 h-3.5 text-slate-400" />
             <span
               className={
                 wsStatus === 'connected'
@@ -738,10 +964,10 @@ export default function App() {
               }
             >
               {wsStatus === 'connected'
-                ? 'gemini-3.8-live 已連線'
+                ? 'gemini-3.8-live 連線中'
                 : wsStatus === 'connecting'
-                ? '連線建立中...'
-                : 'gemini-3.8-live 待命'}
+                ? '自動重連中...'
+                : '待命'}
             </span>
             <span className="text-slate-300" aria-hidden="true">
               ·
@@ -751,15 +977,25 @@ export default function App() {
             </span>
           </div>
 
-          {/* Quick Simulated Speech Trigger Button */}
+          {/* Fast Catch-Up Trigger Button */}
+          <button
+            onClick={() => setShowCatchUpModal(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200/80 rounded transition-colors whitespace-nowrap shrink-0"
+            title="貼上或口述會議重點，Gemini 將立即重新結構化整場會議的心智圖與待辦"
+          >
+            <Sparkles className="w-3 h-3" />
+            <span>速記補全</span>
+          </button>
+
+          {/* Simulated Speech Button */}
           <button
             onClick={handleInjectSimulatedTurn}
             className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200/80 rounded transition-colors whitespace-nowrap shrink-0"
-            title="無需對麥克風說話，直接送入一段模擬會議發言測試 Gemini 3.8 Live 即時生成心智圖與待辦"
+            title="送入測試發言測試 Gemini 3.8 Live"
           >
             <Play className="w-3 h-3 fill-current" />
             <span>
-              注入測試會議發言 ({(simStepIndex % SIMULATED_MEETING_SCRIPT.length) + 1}/
+              測試發言 ({(simStepIndex % SIMULATED_MEETING_SCRIPT.length) + 1}/
               {SIMULATED_MEETING_SCRIPT.length})
             </span>
           </button>
@@ -791,9 +1027,9 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Workspace Container with Optional Collapsible History Sidebar */}
+      {/* Main Workspace */}
       <div className="flex-1 flex min-h-0 relative overflow-hidden">
-        {/* Collapsible LocalStorage Meeting History Sidebar */}
+        {/* Collapsible LocalStorage Meeting History Drawer */}
         {showHistoryDrawer && (
           <aside className="w-72 bg-white border-r border-slate-200 flex flex-col shrink-0 z-20">
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
@@ -860,7 +1096,7 @@ export default function App() {
 
         {/* 3-Column Simultaneous Live Workspace */}
         <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden">
-          {/* Column 1 (30% -> 4 cols on 12-col grid): Structured Notes & Live Transcripts */}
+          {/* Column 1 (30% -> 4 cols): Structured Notes & Live Transcripts */}
           <section className="lg:col-span-4 h-full min-h-0 overflow-hidden">
             <NotesColumn
               notes={activeSession.notes}
@@ -872,10 +1108,11 @@ export default function App() {
               }
               onSendManualUtterance={handleSendUtteranceToLive}
               onNudgeSync={handleNudgeSync}
+              onOpenCatchUpModal={() => setShowCatchUpModal(true)}
             />
           </section>
 
-          {/* Column 2 (45% -> 5 cols on 12-col grid): Interactive SVG Mind Map Canvas */}
+          {/* Column 2 (45% -> 5 cols): Interactive 3-Tier SVG Mind Map Canvas */}
           <section className="lg:col-span-5 h-full min-h-0 overflow-hidden">
             <MindMapCanvas
               nodes={activeSession.mindMapNodes}
@@ -883,10 +1120,11 @@ export default function App() {
               onUpdateNodes={(mindMapNodes) =>
                 updateActiveSession((prev) => ({ ...prev, mindMapNodes }))
               }
+              onOpenInspector={() => setShowInspectorDrawer(true)}
             />
           </section>
 
-          {/* Column 3 (25% -> 3 cols on 12-col grid): Actionable To-Do List */}
+          {/* Column 3 (25% -> 3 cols): Actionable To-Do List */}
           <section className="lg:col-span-3 h-full min-h-0 overflow-hidden">
             <TodoColumn
               todos={activeSession.todos}
@@ -896,7 +1134,130 @@ export default function App() {
             />
           </section>
         </main>
+
+        {/* Right Drawer: Live Model Data Inspector */}
+        {showInspectorDrawer && (
+          <aside className="w-96 bg-white border-l border-slate-200 flex flex-col shrink-0 z-30 shadow-lg">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+              <div className="flex items-center gap-2">
+                <Code2 className="w-4 h-4 text-blue-600" />
+                <span className="text-xs font-semibold text-slate-900">
+                  Gemini 3.8 Live 原始數據檢視器
+                </span>
+              </div>
+              <button
+                onClick={() => setShowInspectorDrawer(false)}
+                className="p-1 text-slate-400 hover:text-slate-700 rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-[11px] text-slate-500">
+              即時顯示模型觸發的 Tool Calling 原始 JSON 參數，方便精準判斷模型產出內容。
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-3">
+              {inspectorLogs.length === 0 ? (
+                <div className="py-12 text-center text-xs text-slate-400">
+                  尚未收到 Tool Call 數據
+                </div>
+              ) : (
+                inspectorLogs.map((log) => (
+                  <div
+                    key={log.id}
+                    className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-semibold text-blue-700">
+                        {log.toolName}
+                      </span>
+                      <span className="text-[11px] font-mono-tabular text-slate-400">
+                        {log.timestamp}
+                      </span>
+                    </div>
+                    <pre className="p-2 bg-white border border-slate-200 rounded text-[10.5px] font-mono overflow-x-auto text-slate-800 leading-tight">
+                      {JSON.stringify(log.args, null, 2)}
+                    </pre>
+                  </div>
+                ))
+              )}
+            </div>
+          </aside>
+        )}
       </div>
+
+      {/* Modal: Catch-up / Reconstruct Meeting from Notes or Speech */}
+      {showCatchUpModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="w-full max-w-xl bg-white rounded-xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-purple-600" />
+                <h3 className="text-sm font-semibold text-slate-900">
+                  口述或貼上會議要點 · Gemini 一鍵補全重構
+                </h3>
+              </div>
+              <button
+                onClick={() => setShowCatchUpModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-700 rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3">
+              <p className="text-xs text-slate-600 leading-relaxed">
+                如果您記得剛才 61 分鐘會議的討論內容、決策或待辦，可直接在下方貼上速記、大綱或口述重點，Gemini 會立即為這場會議重構出<b>結構化紀錄、三層精煉心智圖與待辦清單</b>：
+              </p>
+
+              <textarea
+                value={catchUpText}
+                onChange={(e) => setCatchUpText(e.target.value)}
+                placeholder="例如：
+1. 討論了 Q4 語音平台改版，決定導入 Gemini 3.8 Live，目標延遲小於 500ms。
+2. 建宏負責在週五前交付 WebSocket 壓力測試報告。
+3. 庭瑜負責三欄式工作台的 Figma 原型設計，下週二交付。
+4. 柏翰提醒資安合規，需在存入資料庫前完成敏感個資遮罩驗證..."
+                rows={7}
+                className="w-full p-3 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-purple-600 font-sans leading-relaxed"
+              />
+
+              {catchUpError && (
+                <div className="p-2.5 bg-red-50 border border-red-200 rounded text-xs text-red-700">
+                  {catchUpError}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-3 bg-slate-50 border-t border-slate-200">
+              <button
+                onClick={() => setShowCatchUpModal(false)}
+                className="px-3 py-1.5 text-xs text-slate-600 hover:text-slate-900"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleExecuteCatchUp}
+                disabled={isCatchingUp || !catchUpText.trim()}
+                className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rounded-lg transition-colors"
+              >
+                {isCatchingUp ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Gemini 分析重構中...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>立即補全此會議</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

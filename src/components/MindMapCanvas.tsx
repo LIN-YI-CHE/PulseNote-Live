@@ -9,8 +9,8 @@ import {
   Edit3,
   Check,
   X,
-  ChevronRight,
-  ChevronDown,
+  Code2,
+  Layers,
 } from 'lucide-react';
 import { MindMapNode } from '../types/meeting';
 
@@ -18,6 +18,7 @@ interface MindMapCanvasProps {
   nodes: MindMapNode[];
   onUpdateNodes: (nodes: MindMapNode[]) => void;
   meetingTitle: string;
+  onOpenInspector?: () => void;
 }
 
 interface PositionedNode extends MindMapNode {
@@ -29,19 +30,20 @@ interface PositionedNode extends MindMapNode {
   hasChildren: boolean;
 }
 
-const NODE_WIDTH = 188;
-const NODE_HEIGHT = 46;
-const LEVEL_GAP_X = 250;
-const SIBLING_GAP_Y = 66;
+const NODE_WIDTH = 224;
+const NODE_HEIGHT = 58;
+const LEVEL_GAP_X = 270;
+const SIBLING_GAP_Y = 76;
 
 export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   nodes,
   onUpdateNodes,
   meetingTitle,
+  onOpenInspector,
 }) => {
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const [zoom, setZoom] = useState<number>(0.95);
-  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 60, y: 240 });
+  const [zoom, setZoom] = useState<number>(0.92);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 50, y: 250 });
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
@@ -50,6 +52,10 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   const [editLabel, setEditLabel] = useState<string>('');
   const [editCategory, setEditCategory] =
     useState<MindMapNode['category']>('topic');
+  const [editNotes, setEditNotes] = useState<string>('');
+
+  // Depth view mode: 'all' (3 levels) or 'l2' (only root + main topics)
+  const [viewDepth, setViewDepth] = useState<'all' | 'l2'>('all');
 
   // Compute deterministic tree layout
   const { positionedNodes, edges, bounds } = useMemo(() => {
@@ -67,14 +73,17 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
     // Normalize root node
     const rootNode =
-      nodes.find((n) => n.id === 'root' || n.parentId === null || n.parentId === 'NONE') ||
-      nodes[0];
+      nodes.find(
+        (n) => n.id === 'root' || n.parentId === null || n.parentId === 'NONE'
+      ) || nodes[0];
 
     const childrenMap = new Map<string, MindMapNode[]>();
     for (const n of nodes) {
       if (n.id === rootNode.id) continue;
       const pid =
-        !n.parentId || n.parentId === 'NONE' || !nodes.some((item) => item.id === n.parentId)
+        !n.parentId ||
+        n.parentId === 'NONE' ||
+        !nodes.some((item) => item.id === n.parentId)
           ? rootNode.id
           : n.parentId;
       const list = childrenMap.get(pid) || [];
@@ -87,10 +96,13 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
     const traverse = (node: MindMapNode, depth: number): number => {
       const children = childrenMap.get(node.id) || [];
+      // If viewDepth === 'l2', collapse anything at depth >= 1
+      const isForcedCollapsed = viewDepth === 'l2' && depth >= 1;
+      const effectiveCollapsed = node.collapsed || isForcedCollapsed;
       const hasChildren = children.length > 0;
       const x = depth * LEVEL_GAP_X;
 
-      if (!hasChildren || node.collapsed) {
+      if (!hasChildren || effectiveCollapsed) {
         const y = currentLeafY;
         currentLeafY += SIBLING_GAP_Y;
         resultNodes.push({
@@ -157,7 +169,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     }
 
     let minX = 0;
-    let maxX = 600;
+    let maxX = 700;
     let minY = -200;
     let maxY = 200;
 
@@ -173,7 +185,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       edges: resultEdges,
       bounds: { minX, maxX, minY, maxY },
     };
-  }, [nodes]);
+  }, [nodes, viewDepth]);
 
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
     if ((e.target as HTMLElement).closest('[data-node-interactive="true"]')) {
@@ -196,8 +208,8 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   };
 
   const handleResetView = () => {
-    setZoom(0.95);
-    setPan({ x: 60, y: 240 });
+    setZoom(0.92);
+    setPan({ x: 50, y: 250 });
   };
 
   const handleToggleCollapse = (nodeId: string, e: React.MouseEvent) => {
@@ -215,6 +227,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     setEditingNodeId(node.id);
     setEditLabel(node.label);
     setEditCategory(node.category || 'topic');
+    setEditNotes(node.notes || '');
   };
 
   const handleSaveEdit = () => {
@@ -222,7 +235,12 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     onUpdateNodes(
       nodes.map((n) =>
         n.id === editingNodeId
-          ? { ...n, label: editLabel.trim(), category: editCategory }
+          ? {
+              ...n,
+              label: editLabel.trim(),
+              category: editCategory,
+              notes: editNotes.trim() || undefined,
+            }
           : n
       )
     );
@@ -235,23 +253,22 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     const newNode: MindMapNode = {
       id: newId,
       parentId: targetParentId,
-      label: '新分支節點',
-      category: 'detail',
+      label: '新討論節點',
+      category: targetParentId === 'root' ? 'topic' : 'decision',
     };
-    // Ensure parent is expanded
     const updated = nodes.map((n) =>
       n.id === targetParentId ? { ...n, collapsed: false } : n
     );
     onUpdateNodes([...updated, newNode]);
     setSelectedNodeId(newId);
     setEditingNodeId(newId);
-    setEditLabel('新分支節點');
-    setEditCategory('detail');
+    setEditLabel('新討論節點');
+    setEditCategory(newNode.category);
+    setEditNotes('');
   };
 
   const handleDeleteNode = (nodeId: string) => {
     if (nodeId === 'root') return;
-    // Remove node and its descendants
     const toRemove = new Set<string>([nodeId]);
     let added = true;
     while (added) {
@@ -269,40 +286,10 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     }
   };
 
-  const handleExportSVG = () => {
-    if (!svgRef.current) return;
-    const width = Math.max(800, bounds.maxX - bounds.minX);
-    const height = Math.max(500, bounds.maxY - bounds.minY);
-    const clone = svgRef.current.cloneNode(true) as SVGSVGElement;
-    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    clone.setAttribute(
-      'viewBox',
-      `${bounds.minX} ${bounds.minY} ${width} ${height}`
-    );
-    clone.setAttribute('width', String(width));
-    clone.setAttribute('height', String(height));
-
-    const innerGroup = clone.querySelector('[data-canvas-transform="true"]');
-    if (innerGroup) {
-      innerGroup.setAttribute('transform', 'translate(0, 0) scale(1)');
-    }
-
-    const svgData = new XMLSerializer().serializeToString(clone);
-    const blob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${meetingTitle || 'mindmap'}.svg`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
   const handleExportPNG = () => {
     if (!svgRef.current) return;
-    const width = Math.max(900, bounds.maxX - bounds.minX);
-    const height = Math.max(560, bounds.maxY - bounds.minY);
+    const width = Math.max(960, bounds.maxX - bounds.minX);
+    const height = Math.max(600, bounds.maxY - bounds.minY);
     const clone = svgRef.current.cloneNode(true) as SVGSVGElement;
     clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
     clone.setAttribute(
@@ -358,10 +345,10 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   ) => {
     if (category === 'root') {
       return {
-        fill: '#1E293B',
-        stroke: isSelected ? '#2563EB' : '#0F172A',
+        fill: '#0F172A',
+        stroke: isSelected ? '#2563EB' : '#020617',
         textFill: '#FFFFFF',
-        subLabel: '主題核心',
+        subLabel: 'L1 · 核心主題',
         subFill: '#94A3B8',
       };
     }
@@ -370,7 +357,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         fill: '#EFF6FF',
         stroke: isSelected ? '#2563EB' : '#93C5FD',
         textFill: '#1E3A8A',
-        subLabel: '關鍵決策',
+        subLabel: 'L3 · 關鍵決策',
         subFill: '#2563EB',
       };
     }
@@ -379,26 +366,27 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         fill: '#FEF3C7',
         stroke: isSelected ? '#D97706' : '#FCD34D',
         textFill: '#78350F',
-        subLabel: '行動項目',
+        subLabel: 'L3 · 執行行動',
         subFill: '#B45309',
       };
     }
-    if (category === 'topic') {
-      return {
-        fill: '#FFFFFF',
-        stroke: isSelected ? '#2563EB' : '#CBD5E1',
-        textFill: '#0F172A',
-        subLabel: '討論主軸',
-        subFill: '#475569',
-      };
-    }
     return {
-      fill: '#F8FAFC',
+      fill: '#FFFFFF',
       stroke: isSelected ? '#2563EB' : '#CBD5E1',
-      textFill: '#334155',
-      subLabel: '重點細節',
-      subFill: '#64748B',
+      textFill: '#0F172A',
+      subLabel: 'L2 · 討論主軸',
+      subFill: '#475569',
     };
+  };
+
+  // Split label into 2 lines if longer than 13 characters to avoid truncated words
+  const splitLabelToLines = (text: string): [string, string | null] => {
+    if (text.length <= 13) return [text, null];
+    if (text.length <= 26) {
+      const mid = Math.ceil(text.length / 2);
+      return [text.slice(0, mid), text.slice(mid)];
+    }
+    return [text.slice(0, 13), text.slice(13, 25) + '…'];
   };
 
   return (
@@ -407,7 +395,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-slate-200 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <h2 className="text-sm font-semibold text-slate-900 whitespace-nowrap">
-            02. 互動式心智圖脈絡
+            02. 三層架構心智圖
           </h2>
           <span className="text-xs text-slate-400" aria-hidden="true">
             ·
@@ -418,10 +406,36 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {/* Depth View Filter Toggle */}
+          <div className="flex items-center bg-slate-100 p-0.5 rounded text-xs font-medium text-slate-600">
+            <button
+              onClick={() => setViewDepth('all')}
+              className={`px-2 py-0.5 rounded transition-colors whitespace-nowrap ${
+                viewDepth === 'all'
+                  ? 'bg-white text-slate-900 shadow-2xs font-semibold'
+                  : 'hover:text-slate-900'
+              }`}
+              title="展開全部三層（主軸與決策）"
+            >
+              全部展開
+            </button>
+            <button
+              onClick={() => setViewDepth('l2')}
+              className={`px-2 py-0.5 rounded transition-colors whitespace-nowrap ${
+                viewDepth === 'l2'
+                  ? 'bg-white text-slate-900 shadow-2xs font-semibold'
+                  : 'hover:text-slate-900'
+              }`}
+              title="只顯示核心主題與二級主軸，收合次級細節"
+            >
+              僅看主幹
+            </button>
+          </div>
+
           <button
             onClick={() => handleAddChildNode()}
             className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
-            title="在目前選取的節點下新增子節點"
+            title="在選取節點下新增分支"
           >
             <Plus className="w-3.5 h-3.5" />
             <span>新增節點</span>
@@ -436,19 +450,22 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             <span>匯出 PNG</span>
           </button>
 
-          <button
-            onClick={handleExportSVG}
-            className="px-2 py-1 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded transition-colors whitespace-nowrap shrink-0"
-            title="下載向量 SVG 圖檔"
-          >
-            SVG
-          </button>
+          {onOpenInspector && (
+            <button
+              onClick={onOpenInspector}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors whitespace-nowrap shrink-0"
+              title="查看 Gemini 3.8 Live 呼叫工具的原始 JSON 數據"
+            >
+              <Code2 className="w-3.5 h-3.5" />
+              <span>模型數據</span>
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Inline Node Editor Bar (shown when editing or selecting a node) */}
+      {/* Inline Node Editor Bar */}
       {editingNodeId && (
-        <div className="flex items-center justify-between gap-2 px-4 py-2 bg-blue-50/80 border-b border-blue-200 shrink-0">
+        <div className="flex items-center justify-between gap-2 px-4 py-2 bg-blue-50/90 border-b border-blue-200 shrink-0">
           <div className="flex items-center gap-2 flex-1 min-w-0">
             <span className="text-xs font-medium text-blue-900 whitespace-nowrap">
               編輯節點：
@@ -457,13 +474,16 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
               type="text"
               value={editLabel}
               onChange={(e) => setEditLabel(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleSaveEdit();
-                if (e.key === 'Escape') setEditingNodeId(null);
-              }}
               className="flex-1 min-w-0 px-2.5 py-1 text-xs bg-white border border-blue-300 rounded text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
-              placeholder="輸入節點名稱..."
+              placeholder="輸入節點標題..."
               autoFocus
+            />
+            <input
+              type="text"
+              value={editNotes}
+              onChange={(e) => setEditNotes(e.target.value)}
+              className="w-48 px-2.5 py-1 text-xs bg-white border border-blue-300 rounded text-slate-700 focus:outline-none"
+              placeholder="補充說明細節 (notes)..."
             />
             <select
               value={editCategory}
@@ -472,16 +492,15 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
               }
               className="px-2 py-1 text-xs bg-white border border-blue-300 rounded text-slate-700 focus:outline-none"
             >
-              <option value="topic">討論主軸</option>
-              <option value="decision">關鍵決策</option>
-              <option value="action">行動項目</option>
-              <option value="detail">重點細節</option>
+              <option value="topic">討論主軸 (Level 2)</option>
+              <option value="decision">關鍵決策 (Level 3)</option>
+              <option value="action">執行行動 (Level 3)</option>
             </select>
           </div>
           <div className="flex items-center gap-1 shrink-0">
             <button
               onClick={handleSaveEdit}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded transition-colors whitespace-nowrap"
+              className="flex items-center gap-1 px-3 py-1 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded transition-colors whitespace-nowrap"
             >
               <Check className="w-3.5 h-3.5" />
               <span>儲存</span>
@@ -499,13 +518,13 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
 
       {/* Main Interactive SVG Canvas */}
       <div className="flex-1 relative overflow-hidden">
-        {/* Subtle structural dot matrix background */}
+        {/* Subtle dot matrix background */}
         <div
-          className="absolute inset-0 pointer-events-none opacity-45"
+          className="absolute inset-0 pointer-events-none opacity-40"
           style={{
             backgroundImage:
               'radial-gradient(#CBD5E1 1px, transparent 1px)',
-            backgroundSize: '20px 20px',
+            backgroundSize: '22px 22px',
           }}
         />
 
@@ -539,7 +558,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
                   d={pathData}
                   fill="none"
                   stroke="#94A3B8"
-                  strokeWidth={1.75}
+                  strokeWidth={2}
                   strokeLinecap="round"
                 />
               );
@@ -550,10 +569,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
               const isSelected = selectedNodeId === node.id;
               const style = getCategoryStyles(node.category, isSelected);
               const topY = node.y - node.height / 2;
-              const displayLabel =
-                node.label.length > 13
-                  ? node.label.slice(0, 12) + '…'
-                  : node.label;
+              const [line1, line2] = splitLabelToLines(node.label);
 
               return (
                 <g
@@ -571,57 +587,71 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
                   <rect
                     width={node.width}
                     height={node.height}
-                    rx={8}
-                    ry={8}
+                    rx={9}
+                    ry={9}
                     fill={style.fill}
                     stroke={style.stroke}
-                    strokeWidth={isSelected ? 2 : 1.25}
+                    strokeWidth={isSelected ? 2.5 : 1.5}
                   />
 
-                  {/* Subtle category label */}
+                  {/* Category level subtitle */}
                   <text
                     x={12}
-                    y={15}
+                    y={16}
                     fill={style.subFill}
-                    fontSize={9.5}
+                    fontSize={10}
                     fontWeight={600}
                     fontFamily="Public Sans, sans-serif"
                   >
                     {style.subLabel}
                   </text>
 
-                  {/* Node Primary Title */}
+                  {/* Multi-line Label (Line 1) */}
                   <text
                     x={12}
-                    y={33}
+                    y={line2 ? 33 : 38}
                     fill={style.textFill}
                     fontSize={12.5}
                     fontWeight={600}
                     fontFamily="Plus Jakarta Sans, sans-serif"
                   >
-                    {displayLabel}
+                    {line1}
                   </text>
 
-                  {/* Collapse/Expand Toggle Button if node has children */}
+                  {/* Multi-line Label (Line 2 if text is longer) */}
+                  {line2 && (
+                    <text
+                      x={12}
+                      y={49}
+                      fill={style.textFill}
+                      fontSize={12}
+                      fontWeight={600}
+                      fontFamily="Plus Jakarta Sans, sans-serif"
+                    >
+                      {line2}
+                    </text>
+                  )}
+
+                  {/* Collapse/Expand Toggle Button */}
                   {node.hasChildren && (
                     <g
                       onClick={(e) => handleToggleCollapse(node.id, e)}
-                      transform={`translate(${node.width - 22}, ${
-                        node.height / 2 - 8
+                      transform={`translate(${node.width - 24}, ${
+                        node.height / 2 - 9
                       })`}
                     >
                       <rect
-                        width={16}
-                        height={16}
-                        rx={4}
+                        width={18}
+                        height={18}
+                        rx={5}
                         fill={node.category === 'root' ? '#334155' : '#E2E8F0'}
                       />
                       <text
-                        x={8}
-                        y={11.5}
+                        x={9}
+                        y={13}
                         textAnchor="middle"
-                        fill={node.category === 'root' ? '#F8FAFC' : '#334155'}
-                        fontSize={10}
+                        fill={node.category === 'root' ? '#F8FAFC' : '#1E293B'}
+                        fontSize={11}
                         fontWeight={700}
                         fontFamily="JetBrains Mono, monospace"
                       >
@@ -635,12 +665,17 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           </g>
         </svg>
 
-        {/* Bottom-left Selected Node Quick Actions */}
+        {/* Selected Node Details Bar */}
         {selectedNodeId && (
           <div className="absolute bottom-3 left-3 flex items-center gap-2 px-3 py-1.5 bg-white/95 backdrop-blur border border-slate-200 rounded-lg text-xs text-slate-600 shadow-xs">
-            <span className="font-medium text-slate-900 truncate max-w-[160px]">
+            <span className="font-semibold text-slate-900 truncate max-w-[200px]">
               {nodes.find((n) => n.id === selectedNodeId)?.label || '已選節點'}
             </span>
+            {nodes.find((n) => n.id === selectedNodeId)?.notes && (
+              <span className="text-slate-400 text-[11px] truncate max-w-[180px]">
+                ({nodes.find((n) => n.id === selectedNodeId)?.notes})
+              </span>
+            )}
             <span aria-hidden="true" className="text-slate-300">
               ·
             </span>
@@ -652,7 +687,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
               className="flex items-center gap-1 text-slate-600 hover:text-blue-600 font-medium whitespace-nowrap"
             >
               <Edit3 className="w-3.5 h-3.5" />
-              <span>編輯文字</span>
+              <span>編輯</span>
             </button>
             <span aria-hidden="true" className="text-slate-300">
               ·
@@ -662,7 +697,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
               className="flex items-center gap-1 text-slate-600 hover:text-blue-600 font-medium whitespace-nowrap"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>新增子分支</span>
+              <span>新增子節點</span>
             </button>
             {selectedNodeId !== 'root' && (
               <>
@@ -684,9 +719,9 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
         {/* Bottom-right Zoom & Pan Controls */}
         <div className="absolute bottom-3 right-3 flex items-center gap-1 p-1 bg-white/95 backdrop-blur border border-slate-200 rounded-lg shadow-xs">
           <button
-            onClick={() => setZoom((z) => Math.max(0.45, +(z - 0.1).toFixed(2)))}
+            onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.1).toFixed(2)))}
             className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded transition-colors"
-            title="縮小畫布"
+            title="縮小"
           >
             <ZoomOut className="w-3.5 h-3.5" />
           </button>
@@ -696,7 +731,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           <button
             onClick={() => setZoom((z) => Math.min(2.0, +(z + 0.1).toFixed(2)))}
             className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded transition-colors"
-            title="放大畫布"
+            title="放大"
           >
             <ZoomIn className="w-3.5 h-3.5" />
           </button>
