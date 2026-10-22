@@ -18,6 +18,10 @@ import {
   X,
   ShieldCheck,
   RefreshCw,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  MessageSquare,
 } from 'lucide-react';
 import {
   MeetingSession,
@@ -78,6 +82,12 @@ export default function App() {
   const [showHistoryDrawer, setShowHistoryDrawer] = useState<boolean>(false);
   const [showInspectorDrawer, setShowInspectorDrawer] = useState<boolean>(false);
   const [showCatchUpModal, setShowCatchUpModal] = useState<boolean>(false);
+  const [showCorrectionModal, setShowCorrectionModal] = useState<boolean>(false);
+  const [correctionInstruction, setCorrectionInstruction] = useState<string>('');
+  const [isCorrecting, setIsCorrecting] = useState<boolean>(false);
+  const [correctionToast, setCorrectionToast] = useState<string | null>(null);
+  const [isListeningVoiceCorrection, setIsListeningVoiceCorrection] = useState<boolean>(false);
+  const voiceRecognitionRef = useRef<any>(null);
 
   // Catch-up / Reconstruction modal state
   const [catchUpText, setCatchUpText] = useState<string>('');
@@ -101,6 +111,104 @@ export default function App() {
     '就緒 · 支援長會議無縫滾動連線'
   );
   const [simStepIndex, setSimStepIndex] = useState<number>(0);
+  const [isConvergingMindMap, setIsConvergingMindMap] = useState<boolean>(false);
+  const [isConvergingNotes, setIsConvergingNotes] = useState<boolean>(false);
+  const lastToolCallTimestampRef = useRef<number>(Date.now());
+
+  // Draggable Column Widths State (Left: Notes, Right: Todos, Center: MindMap auto fills)
+  const [leftColWidthPercent, setLeftColWidthPercent] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pulsenote_left_col_width');
+      return saved ? Math.max(18, Math.min(55, parseFloat(saved))) : 33;
+    } catch {
+      return 33;
+    }
+  });
+
+  const [rightColWidthPercent, setRightColWidthPercent] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pulsenote_right_col_width');
+      return saved ? Math.max(16, Math.min(42, parseFloat(saved))) : 24;
+    } catch {
+      return 24;
+    }
+  });
+
+  const [isRightColCollapsed, setIsRightColCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('pulsenote_right_col_collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const [isDraggingLeftResizer, setIsDraggingLeftResizer] = useState<boolean>(false);
+  const [isDraggingRightResizer, setIsDraggingRightResizer] = useState<boolean>(false);
+  const workspaceContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // Global mousemove/mouseup listener for column resizing
+  useEffect(() => {
+    if (!isDraggingLeftResizer && !isDraggingRightResizer) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!workspaceContainerRef.current) return;
+      const rect = workspaceContainerRef.current.getBoundingClientRect();
+      const totalWidth = rect.width;
+      if (totalWidth <= 0) return;
+
+      if (isDraggingLeftResizer) {
+        const offsetLeft = e.clientX - rect.left;
+        const percent = (offsetLeft / totalWidth) * 100;
+        const clamped = Math.max(18, Math.min(55, percent));
+        setLeftColWidthPercent(clamped);
+        try {
+          localStorage.setItem('pulsenote_left_col_width', String(clamped));
+        } catch {
+          // ignore
+        }
+      } else if (isDraggingRightResizer) {
+        const offsetRight = rect.right - e.clientX;
+        const percent = (offsetRight / totalWidth) * 100;
+        const clamped = Math.max(16, Math.min(42, percent));
+        setRightColWidthPercent(clamped);
+        try {
+          localStorage.setItem('pulsenote_right_col_width', String(clamped));
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsDraggingLeftResizer(false);
+      setIsDraggingRightResizer(false);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingLeftResizer, isDraggingRightResizer]);
+
+  const [copySuccessBanner, setCopySuccessBanner] = useState<string | null>(null);
+
+  // Auto-sync client sessions to server storage so backend retains meeting data
+  useEffect(() => {
+    if (sessions.length === 0) return;
+    const timer = setTimeout(() => {
+      fetch('/api/sessions/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessions }),
+      }).catch((err) => {
+        // background sync warning
+        console.warn('Auto-sync to server error:', err);
+      });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [sessions]);
 
   // Local Audio Backup via MediaRecorder (Safety net for 60+ min meetings)
   const [backupAudioUrl, setBackupAudioUrl] = useState<string | null>(null);
@@ -126,6 +234,28 @@ export default function App() {
 
   useEffect(() => {
     isRecordingRef.current = isLiveRecording;
+  }, [isLiveRecording]);
+
+  // Client-side auto-sync watchdog: periodic nudge to prevent Gemini Live from stalling
+  useEffect(() => {
+    if (!isLiveRecording) return;
+
+    const watchdogInterval = window.setInterval(() => {
+      const now = Date.now();
+      const timeSinceLastToolCall = now - lastToolCallTimestampRef.current;
+
+      // If more than 20 seconds have elapsed without tool calls during recording
+      if (timeSinceLastToolCall > 20000) {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'nudge_sync' }));
+          setLastToolSyncInfo('自動催化即時整理中...');
+        }
+      }
+    }, 10000);
+
+    return () => {
+      window.clearInterval(watchdogInterval);
+    };
   }, [isLiveRecording]);
 
   // Persist to localStorage
@@ -166,6 +296,7 @@ export default function App() {
   const handleLiveToolCall = useCallback(
     (toolName: string, args: any, timestamp: string, callId?: string) => {
       if (!args) return;
+      lastToolCallTimestampRef.current = Date.now();
 
       // Log to Inspector
       setInspectorLogs((prev) => [
@@ -296,6 +427,12 @@ export default function App() {
       const ws = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
       wsRef.current = ws;
 
+      const connectionTimeout = setTimeout(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          resolve(ws);
+        }
+      }, 5000);
+
       ws.onopen = () => {
         setWsStatus('connected');
       };
@@ -313,6 +450,7 @@ export default function App() {
           }
 
           if (msg.type === 'session_status' && msg.status === 'connected') {
+            clearTimeout(connectionTimeout);
             setWsStatus('connected');
             setLastToolSyncInfo(
               msg.rolloverCount
@@ -358,7 +496,9 @@ export default function App() {
               msg.callId
             );
           } else if (msg.type === 'error') {
+            clearTimeout(connectionTimeout);
             setErrorBanner(msg.message);
+            reject(new Error(msg.message));
           }
         } catch (err) {
           console.error('Error parsing WS message:', err);
@@ -366,13 +506,14 @@ export default function App() {
       };
 
       ws.onerror = () => {
+        clearTimeout(connectionTimeout);
         setWsStatus('disconnected');
-        reject(new Error('WebSocket error'));
+        reject(new Error('WebSocket 連線失敗'));
       };
 
       ws.onclose = () => {
+        clearTimeout(connectionTimeout);
         setWsStatus('disconnected');
-        // Auto-reconnect if user is still actively recording!
         if (isRecordingRef.current) {
           setLastToolSyncInfo('連線中斷，正在自動重新連線（麥克風持續錄音備份中）...');
           setTimeout(() => {
@@ -451,20 +592,48 @@ export default function App() {
       return;
     }
 
-    // Start recording
+    // Phase 1: Request Microphone Access
+    let stream: MediaStream;
     try {
       setErrorBanner(null);
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
         },
       });
       mediaStreamRef.current = stream;
+    } catch (micErr: any) {
+      console.error('Microphone access error:', micErr);
+      if (
+        micErr?.name === 'NotAllowedError' ||
+        micErr?.name === 'PermissionDeniedError'
+      ) {
+        setErrorBanner(
+          '瀏覽器尚未授予麥克風權限：請點擊網址列旁的網站設定（鎖頭/麥克風圖示），將麥克風設為「允許」後重試。'
+        );
+      } else if (
+        micErr?.name === 'NotReadableError' ||
+        micErr?.name === 'TrackStartError'
+      ) {
+        setErrorBanner(
+          '麥克風裝置已被其他應用程式（如 Google Meet、Zoom 或系統設定）獨佔使用中，請釋放裝置後重試。'
+        );
+      } else if (
+        micErr?.name === 'NotFoundError' ||
+        micErr?.name === 'DevicesNotFoundError'
+      ) {
+        setErrorBanner('電腦未偵測到可用的麥克風輸入裝置，請檢查硬體連接。');
+      } else {
+        setErrorBanner(`無法啟動麥克風（${micErr?.message || '未知錯誤'}）。您仍可點擊「速記補全」或「測試發言」繼續使用。`);
+      }
+      return;
+    }
 
-      // 1. Start browser-local backup recording via MediaRecorder
+    // Phase 2: Start Local Backup & Live Connection
+    try {
+      // 1. Start browser-local backup recording via MediaRecorder immediately
       try {
         const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
           ? 'audio/webm;codecs=opus'
@@ -497,7 +666,7 @@ export default function App() {
       // 2. Start WebSocket connection to Gemini 3.8 Live
       const ws = await ensureLiveWebSocket();
 
-      // 3. Start 16kHz PCM Web Audio processor
+      // 3. Start Web Audio processor (resamples to 16kHz for Gemini Live)
       const audioCtx = new AudioContext({ sampleRate: 16000 });
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
@@ -530,10 +699,17 @@ export default function App() {
           durationSeconds: prev.durationSeconds + 1,
         }));
       }, 1000);
-    } catch (err: any) {
-      console.error('Microphone access or Live connection error:', err);
+    } catch (liveErr: any) {
+      console.error('Gemini Live session connection error:', liveErr);
+      // Clean up media stream if initial setup failed so mic icon doesn't dangle
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
+      setIsLiveRecording(false);
+      isRecordingRef.current = false;
       setErrorBanner(
-        '無法啟動麥克風（請確認瀏覽器麥克風權限），您仍可點擊「注入測試對話」或「速記補全」體驗完整功能。'
+        `Gemini 3.8 Live 連線異常（${liveErr?.message || '伺服器連線建立失敗'}）。您可稍後重試，或點擊「注入測試對話」/「速記補全」。`
       );
     }
   };
@@ -674,6 +850,243 @@ export default function App() {
     }
   };
 
+  // Conversational AI Error Correction Handler
+  const handleExecuteCorrection = async (customInstruction?: string) => {
+    const text = (customInstruction || correctionInstruction).trim();
+    if (!text) return;
+    setIsCorrecting(true);
+
+    try {
+      const response = await fetch('/api/meeting/correct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          instruction: text,
+          session: activeSession,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok || !resData.success) {
+        throw new Error(resData.error || '修正失敗');
+      }
+
+      updateActiveSession((prev) => ({
+        ...prev,
+        notes: Array.isArray(resData.notes) ? resData.notes : prev.notes,
+        mindMapNodes: Array.isArray(resData.mindMapNodes)
+          ? resData.mindMapNodes
+          : prev.mindMapNodes,
+        todos: Array.isArray(resData.todos) ? resData.todos : prev.todos,
+        transcripts: Array.isArray(resData.transcripts)
+          ? resData.transcripts
+          : prev.transcripts,
+      }));
+
+      const summaryMsg = resData.summary || '已根據您的指令完成錯詞與內容修正！';
+      setCorrectionToast(summaryMsg);
+      setLastToolSyncInfo(summaryMsg);
+      setShowCorrectionModal(false);
+      setCorrectionInstruction('');
+      setTimeout(() => setCorrectionToast(null), 6000);
+    } catch (err: any) {
+      console.error('Correction error:', err);
+      setErrorBanner(`AI 對話修訂失敗：${err?.message || '請確認網路狀態'}`);
+    } finally {
+      setIsCorrecting(false);
+    }
+  };
+
+  const handleToggleVoiceCorrection = () => {
+    if (isListeningVoiceCorrection) {
+      if (voiceRecognitionRef.current) {
+        voiceRecognitionRef.current.stop();
+      }
+      setIsListeningVoiceCorrection(false);
+      return;
+    }
+
+    const SpeechRecognition =
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setErrorBanner('目前瀏覽器環境未支援即時語音識別，請直接鍵入修正指令。');
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'zh-TW';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+
+      recognition.onstart = () => {
+        setIsListeningVoiceCorrection(true);
+      };
+
+      recognition.onresult = (event: any) => {
+        let transcript = '';
+        for (let i = 0; i < event.results.length; i++) {
+          transcript += event.results[i][0].transcript;
+        }
+        if (transcript.trim()) {
+          setCorrectionInstruction(transcript);
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        console.warn('Voice recognition error in correction:', event);
+        setIsListeningVoiceCorrection(false);
+      };
+
+      recognition.onend = () => {
+        setIsListeningVoiceCorrection(false);
+      };
+
+      recognition.start();
+      voiceRecognitionRef.current = recognition;
+    } catch (err: any) {
+      console.error('Failed to start voice recognition:', err);
+      setIsListeningVoiceCorrection(false);
+    }
+  };
+
+  const handleCloseCorrectionModal = () => {
+    if (voiceRecognitionRef.current) {
+      voiceRecognitionRef.current.stop();
+    }
+    setIsListeningVoiceCorrection(false);
+    setShowCorrectionModal(false);
+  };
+
+  // Smart Mind Map Convergence Handler
+  const handleExecuteConvergeMindMap = async () => {
+    if (!activeSession || activeSession.mindMapNodes.length <= 2) return;
+    setIsConvergingMindMap(true);
+
+    try {
+      setLastToolSyncInfo('Gemini 正在將分散分支聚合為 3~4 個核心主題柱...');
+      const response = await fetch('/api/meeting/converge-mindmap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meetingTitle: activeSession.title,
+          mindMapNodes: activeSession.mindMapNodes,
+          notes: activeSession.notes,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok || !resData.success) {
+        throw new Error(resData.error || '收斂聚合失敗');
+      }
+
+      if (Array.isArray(resData.nodes) && resData.nodes.length > 0) {
+        updateActiveSession((prev) => ({
+          ...prev,
+          mindMapNodes: resData.nodes.map((n: any) => ({
+            id: n.id,
+            parentId:
+              !n.parentId || n.parentId === 'NONE' ? null : n.parentId,
+            label: n.label,
+            category: n.category || 'topic',
+            notes: n.notes,
+          })),
+        }));
+
+        const successMsg = resData.summary || '已成功將心智圖收斂聚合為核心支柱！';
+        setCorrectionToast(successMsg);
+        setLastToolSyncInfo(successMsg);
+        setTimeout(() => setCorrectionToast(null), 5000);
+      }
+    } catch (err: any) {
+      console.error('Convergence error:', err);
+      setErrorBanner(`心智圖收斂失敗：${err?.message || '請稍後重試'}`);
+    } finally {
+      setIsConvergingMindMap(false);
+    }
+  };
+
+  // Smart Structured Notes Convergence Handler
+  const handleExecuteConvergeNotes = async () => {
+    if (!activeSession || activeSession.notes.length <= 1) return;
+    setIsConvergingNotes(true);
+
+    try {
+      setLastToolSyncInfo('Gemini 正在智慧整頓結構化會議紀錄，聚合核心議題與決策...');
+      const response = await fetch('/api/meeting/converge-notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meetingTitle: activeSession.title,
+          notes: activeSession.notes,
+          transcripts: activeSession.transcripts,
+          mindMapNodes: activeSession.mindMapNodes,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok || !resData.success) {
+        throw new Error(resData.error || '會議紀錄整頓失敗');
+      }
+
+      if (Array.isArray(resData.sections) && resData.sections.length > 0) {
+        const nowTime = new Date().toLocaleTimeString('zh-TW', {
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+        updateActiveSession((prev) => ({
+          ...prev,
+          notes: resData.sections.map((s: any, idx: number) => ({
+            id: s.id || `topic-${idx + 1}`,
+            topic: s.topic || `核心議題 ${idx + 1}`,
+            summary: s.summary || '',
+            keyDecisions: Array.isArray(s.keyDecisions) ? s.keyDecisions : [],
+            updatedAt: s.updatedAt || nowTime,
+          })),
+        }));
+
+        const successMsg =
+          resData.summary || '已成功將會議紀錄智慧收斂整頓！';
+        setCorrectionToast(successMsg);
+        setLastToolSyncInfo(successMsg);
+        setTimeout(() => setCorrectionToast(null), 5000);
+      }
+    } catch (err: any) {
+      console.error('Notes convergence error:', err);
+      setErrorBanner(`會議紀錄收斂失敗：${err?.message || '請稍後重試'}`);
+    } finally {
+      setIsConvergingNotes(false);
+    }
+  };
+
+  // Force Unstick & Instant Reconnect Trigger
+  const handleForceUnstick = () => {
+    setLastToolSyncInfo('正在強制催化輸出與重整連線...');
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'reconnect_live',
+          contextSummary: `目前會議標題：${activeSession.title}。已記錄 ${activeSession.notes.length} 個章節重點、${activeSession.mindMapNodes.length} 個心智圖節點與 ${activeSession.todos.length} 個待辦事項。`,
+        })
+      );
+      setTimeout(() => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'nudge_sync' }));
+        }
+      }, 800);
+    } else {
+      ensureLiveWebSocket()
+        .then((ws) => {
+          ws.send(JSON.stringify({ type: 'nudge_sync' }));
+        })
+        .catch(() => {});
+    }
+  };
+
   const handleCreateNewSession = () => {
     const now = new Date();
     const dateStr = now.toISOString().slice(0, 10);
@@ -727,6 +1140,84 @@ export default function App() {
     );
   };
 
+  const handleAddTodoFromNode = (
+    task: string,
+    priority: 'high' | 'medium' | 'low' = 'medium'
+  ) => {
+    if (!activeSession) return;
+    const newTodo: TodoItem = {
+      id: `todo-${Date.now().toString().slice(-5)}`,
+      task,
+      assignee: '待指派',
+      priority,
+      completed: false,
+      createdAt: new Date().toLocaleTimeString('zh-TW', {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    };
+    updateActiveSession((prev) => ({
+      ...prev,
+      todos: [newTodo, ...prev.todos],
+    }));
+  };
+
+  const handleCopySessionForDiscussion = (sessionToCopy = activeSession) => {
+    if (!sessionToCopy) return;
+    let text = `【會議紀錄】：${sessionToCopy.title}\n`;
+    text += `【會議時間】：${sessionToCopy.createdAt || sessionToCopy.updatedAt}\n\n`;
+
+    text += `### 一、結構化章節與重點摘要\n`;
+    if (sessionToCopy.notes.length === 0) {
+      text += `(尚無結構化章節)\n`;
+    } else {
+      sessionToCopy.notes.forEach((n, idx) => {
+        text += `${idx + 1}. 【${n.topic}】\n`;
+        text += `   - 重點摘要：${n.summary}\n`;
+        if (n.keyDecisions && n.keyDecisions.length > 0) {
+          text += `   - 關鍵決策：\n`;
+          n.keyDecisions.forEach((dec) => {
+            text += `     * ${dec}\n`;
+          });
+        }
+      });
+    }
+
+    text += `\n### 二、三層架構心智圖節點\n`;
+    sessionToCopy.mindMapNodes.forEach((node) => {
+      const parent = sessionToCopy.mindMapNodes.find((p) => p.id === node.parentId);
+      text += `- [${node.category || 'node'}] ${node.label} ${
+        parent ? `(所屬分支: ${parent.label})` : '(核心根主題)'
+      }${node.notes ? ` :: 備忘：${node.notes}` : ''}\n`;
+    });
+
+    text += `\n### 三、待辦事項清單\n`;
+    if (sessionToCopy.todos.length === 0) {
+      text += `(無待辦事項)\n`;
+    } else {
+      sessionToCopy.todos.forEach((td, idx) => {
+        text += `${idx + 1}. [${td.completed ? '已完成' : '進行中'}] ${td.task} (負責: ${
+          td.assignee
+        }, 優先級: ${td.priority}${td.dueDate ? `, 期限: ${td.dueDate}` : ''})\n`;
+      });
+    }
+
+    if (sessionToCopy.transcripts.length > 0) {
+      text += `\n### 四、即時語音轉錄逐字稿 (${sessionToCopy.transcripts.length} 筆發言)\n`;
+      sessionToCopy.transcripts.forEach((tr) => {
+        text += `[${tr.timestamp}] ${tr.speaker}: ${tr.text}\n`;
+      });
+    }
+
+    navigator.clipboard.writeText(text).then(() => {
+      setCopySuccessBanner(
+        `已成功複製會議完整內容！請直接在對話框中貼上（Ctrl+V），即可與 AI 針對本場會議進行深度討論。`
+      );
+      setTimeout(() => setCopySuccessBanner(null), 6000);
+    });
+  };
+
   const formatDuration = (secs: number) => {
     const mins = Math.floor(secs / 60);
     const rem = secs % 60;
@@ -777,6 +1268,18 @@ export default function App() {
           >
             <Sparkles className="w-3.5 h-3.5" />
             <span>速記補全重構</span>
+          </a>
+          <a
+            href="#correct"
+            onClick={(e) => {
+              e.preventDefault();
+              setShowCorrectionModal(true);
+            }}
+            className="text-amber-800 hover:text-amber-950 transition-colors whitespace-nowrap shrink-0 font-semibold flex items-center gap-1"
+            title="用自然語言向 AI 下指令修正錯字、人名或心智圖"
+          >
+            <Edit3 className="w-3.5 h-3.5" />
+            <span>對話修訂錯詞</span>
           </a>
           <a
             href="#history"
@@ -910,16 +1413,16 @@ export default function App() {
         </div>
 
         {/* Right: Live Telemetry, Audio Backup & Quick Actions */}
-        <div className="flex items-center gap-3 text-xs text-slate-600 shrink-0">
+        <div className="flex items-center gap-2.5 text-xs text-slate-600 shrink-0 flex-wrap justify-end">
           {/* Recording Timer & Audio Meter */}
-          <div className="flex items-center gap-2">
-            <span className="text-slate-500 whitespace-nowrap">收音時長</span>
-            <span className="font-mono-tabular font-semibold text-slate-900">
+          <div className="flex items-center gap-1.5 px-2 py-1 bg-slate-50 border border-slate-200/80 rounded-md">
+            <span className="text-slate-500 whitespace-nowrap text-[11px]">時長</span>
+            <span className="font-mono-tabular font-semibold text-slate-900 text-xs">
               {formatDuration(activeSession.durationSeconds)}
             </span>
             {isLiveRecording && (
               <div
-                className="w-14 h-2 bg-slate-200 rounded-full overflow-hidden"
+                className="w-12 h-1.5 bg-slate-200 rounded-full overflow-hidden ml-1"
                 title="麥克風即時音量"
               >
                 <div
@@ -939,21 +1442,26 @@ export default function App() {
               title="下載剛才在瀏覽器本機錄下的完整音訊檔"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>下載錄音備份 (WebM)</span>
+              <span>錄音備份</span>
             </a>
           ) : isLiveRecording ? (
-            <div className="flex items-center gap-1 text-[11px] text-emerald-700 font-medium">
+            <div className="hidden sm:flex items-center gap-1 text-[11px] text-emerald-700 font-medium px-2 py-0.5 bg-emerald-50/80 rounded border border-emerald-200/60">
               <ShieldCheck className="w-3.5 h-3.5" />
-              <span>本機雙重備份中</span>
+              <span>雙重備份中</span>
             </div>
           ) : null}
 
-          <span className="text-slate-300" aria-hidden="true">
-            ·
-          </span>
-
-          {/* Live Session Status */}
-          <div className="hidden lg:flex items-center gap-1.5 text-xs">
+          {/* Live Session Status Pill */}
+          <div className="hidden xl:flex items-center gap-1.5 px-2.5 py-1 bg-slate-50 border border-slate-200/80 rounded-md text-xs">
+            <span
+              className={`inline-block w-2 h-2 rounded-full ${
+                wsStatus === 'connected'
+                  ? 'bg-emerald-500 animate-pulse'
+                  : wsStatus === 'connecting'
+                  ? 'bg-amber-500 animate-ping'
+                  : 'bg-slate-300'
+              }`}
+            />
             <span
               className={
                 wsStatus === 'connected'
@@ -964,52 +1472,96 @@ export default function App() {
               }
             >
               {wsStatus === 'connected'
-                ? 'gemini-3.8-live 連線中'
+                ? 'Live 連線中'
                 : wsStatus === 'connecting'
-                ? '自動重連中...'
+                ? '重連中...'
                 : '待命'}
-            </span>
-            <span className="text-slate-300" aria-hidden="true">
-              ·
-            </span>
-            <span className="text-slate-500 font-mono-tabular">
-              {lastToolSyncInfo}
             </span>
           </div>
 
-          {/* Fast Catch-Up Trigger Button */}
-          <button
-            onClick={() => setShowCatchUpModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200/80 rounded transition-colors whitespace-nowrap shrink-0"
-            title="貼上或口述會議重點，Gemini 將立即重新結構化整場會議的心智圖與待辦"
-          >
-            <Sparkles className="w-3 h-3" />
-            <span>速記補全</span>
-          </button>
+          {/* AI Assistance Buttons Group */}
+          <div className="flex items-center gap-1 bg-slate-100/80 p-0.5 rounded-lg border border-slate-200/60">
+            {/* Conversational Error Correction Button */}
+            <button
+              onClick={() => setShowCorrectionModal(true)}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-800 bg-white hover:bg-amber-50 border border-amber-200/80 rounded-md transition-colors whitespace-nowrap shadow-2xs"
+              title="用自然語言對話請 AI 修正人名錯字、心智圖節點或待辦內容"
+            >
+              <Edit3 className="w-3 h-3 text-amber-600" />
+              <span>對話修訂</span>
+            </button>
 
-          {/* Simulated Speech Button */}
-          <button
-            onClick={handleInjectSimulatedTurn}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200/80 rounded transition-colors whitespace-nowrap shrink-0"
-            title="送入測試發言測試 Gemini 3.8 Live"
-          >
-            <Play className="w-3 h-3 fill-current" />
-            <span>
-              測試發言 ({(simStepIndex % SIMULATED_MEETING_SCRIPT.length) + 1}/
-              {SIMULATED_MEETING_SCRIPT.length})
-            </span>
-          </button>
+            {/* Fast Catch-Up Trigger Button */}
+            <button
+              onClick={() => setShowCatchUpModal(true)}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-purple-700 bg-white hover:bg-purple-50 border border-purple-200/80 rounded-md transition-colors whitespace-nowrap shadow-2xs"
+              title="貼上或口述會議重點，Gemini 將立即重新結構化整場會議的心智圖與待辦"
+            >
+              <Sparkles className="w-3 h-3 text-purple-600" />
+              <span>速記補全</span>
+            </button>
 
-          <button
-            onClick={handleExportMarkdownReport}
-            className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
-            title="匯出完整 Markdown 會議報告"
-          >
-            <FileDown className="w-3.5 h-3.5" />
-            <span>匯出 .MD</span>
-          </button>
+            {/* Force Catalyze / Unstick Button */}
+            <button
+              onClick={handleForceUnstick}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-700 bg-white hover:bg-blue-50 border border-blue-200/80 rounded-md transition-colors whitespace-nowrap shadow-2xs"
+              title="當感覺 AI 停止更新或停頓時，點擊此處立即催化輸出並重整連線"
+            >
+              <RefreshCw className="w-3 h-3 text-blue-600" />
+              <span>催化重整</span>
+            </button>
+          </div>
+
+          {/* Utility Buttons Group */}
+          <div className="flex items-center gap-1">
+            {/* Simulated Speech Button */}
+            <button
+              onClick={handleInjectSimulatedTurn}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
+              title="送入測試發言測試 Gemini 3.8 Live"
+            >
+              <Play className="w-3 h-3 fill-current text-blue-600" />
+              <span>
+                測試發言 ({(simStepIndex % SIMULATED_MEETING_SCRIPT.length) + 1})
+              </span>
+            </button>
+
+            <button
+              onClick={() => handleCopySessionForDiscussion(activeSession)}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded transition-colors whitespace-nowrap shrink-0 shadow-2xs"
+              title="一鍵複製整場會議紀錄（包含逐字稿、重點章節與心智圖），可直接貼在對話框中與 AI 進行深度討論"
+            >
+              <MessageSquare className="w-3.5 h-3.5 text-emerald-600" />
+              <span>複製會議 (與 AI 討論)</span>
+            </button>
+
+            <button
+              onClick={handleExportMarkdownReport}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
+              title="匯出完整 Markdown 會議報告"
+            >
+              <FileDown className="w-3.5 h-3.5" />
+              <span>匯出 .MD</span>
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Copy Success Notification Banner */}
+      {copySuccessBanner && (
+        <div className="flex items-center justify-between px-6 py-2.5 bg-emerald-50 border-b border-emerald-200 text-xs text-emerald-800 shrink-0 animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-medium">{copySuccessBanner}</span>
+          </div>
+          <button
+            onClick={() => setCopySuccessBanner(null)}
+            className="text-xs font-medium underline text-emerald-700 hover:text-emerald-900"
+          >
+            關閉提示
+          </button>
+        </div>
+      )}
 
       {/* Error Notification Banner */}
       {errorBanner && (
@@ -1078,15 +1630,27 @@ export default function App() {
                       </div>
                     </div>
 
-                    {sessions.length > 1 && (
+                    <div className="flex items-center gap-1 shrink-0">
                       <button
-                        onClick={(e) => handleDeleteSession(sess.id, e)}
-                        className="p-1 text-slate-400 hover:text-red-600 rounded shrink-0"
-                        title="刪除此會議紀錄"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleCopySessionForDiscussion(sess);
+                        }}
+                        className="p-1 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded transition-colors"
+                        title="一鍵複製此會議紀錄以供貼至 AI 進行深度討論"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        <Copy className="w-3.5 h-3.5" />
                       </button>
-                    )}
+                      {sessions.length > 1 && (
+                        <button
+                          onClick={(e) => handleDeleteSession(sess.id, e)}
+                          className="p-1 text-slate-400 hover:text-red-600 rounded shrink-0"
+                          title="刪除此會議紀錄"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 );
               })}
@@ -1094,10 +1658,24 @@ export default function App() {
           </aside>
         )}
 
-        {/* 3-Column Simultaneous Live Workspace */}
-        <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden">
-          {/* Column 1 (30% -> 4 cols): Structured Notes & Live Transcripts */}
-          <section className="lg:col-span-4 h-full min-h-0 overflow-hidden">
+        {/* 3-Column Simultaneous Live Workspace with Resizable Split Columns */}
+        <main
+          ref={workspaceContainerRef}
+          className={`flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden relative ${
+            isDraggingLeftResizer || isDraggingRightResizer ? 'select-none' : ''
+          }`}
+          style={{
+            cursor:
+              isDraggingLeftResizer || isDraggingRightResizer
+                ? 'col-resize'
+                : 'default',
+          }}
+        >
+          {/* Column 1: Structured Notes & Live Transcripts (Resizable Left Column) */}
+          <section
+            style={{ width: `${leftColWidthPercent}%` }}
+            className="w-full lg:w-auto h-full min-h-0 overflow-hidden flex flex-col shrink-0 min-w-[260px] max-w-full lg:max-w-[65%]"
+          >
             <NotesColumn
               notes={activeSession.notes}
               transcripts={activeSession.transcripts}
@@ -1109,11 +1687,33 @@ export default function App() {
               onSendManualUtterance={handleSendUtteranceToLive}
               onNudgeSync={handleNudgeSync}
               onOpenCatchUpModal={() => setShowCatchUpModal(true)}
+              onOpenCorrectionModal={() => setShowCorrectionModal(true)}
+              onConvergeNotes={handleExecuteConvergeNotes}
+              isConvergingNotes={isConvergingNotes}
             />
           </section>
 
-          {/* Column 2 (45% -> 5 cols): Interactive 3-Tier SVG Mind Map Canvas */}
-          <section className="lg:col-span-5 h-full min-h-0 overflow-hidden">
+          {/* Left Draggable Resizer Splitter */}
+          <div
+            onMouseDown={() => setIsDraggingLeftResizer(true)}
+            onDoubleClick={() => {
+              setLeftColWidthPercent(33);
+              try {
+                localStorage.setItem('pulsenote_left_col_width', '33');
+              } catch {
+                // ignore
+              }
+            }}
+            className={`hidden lg:flex flex-col items-center justify-center w-1.5 hover:w-2 bg-slate-200 hover:bg-blue-500 cursor-col-resize select-none relative group transition-all shrink-0 z-10 ${
+              isDraggingLeftResizer ? 'w-2 bg-blue-600' : ''
+            }`}
+            title="按住拖曳調整左欄寬度；雙擊重設為 33%"
+          >
+            <div className="w-1 h-7 rounded-full bg-slate-400 group-hover:bg-white transition-colors" />
+          </div>
+
+          {/* Column 2: Interactive 3-Tier SVG Mind Map Canvas (Fills remaining workspace dynamically) */}
+          <section className="flex-1 min-w-[280px] h-full min-h-0 overflow-hidden flex flex-col">
             <MindMapCanvas
               nodes={activeSession.mindMapNodes}
               meetingTitle={activeSession.title}
@@ -1121,18 +1721,86 @@ export default function App() {
                 updateActiveSession((prev) => ({ ...prev, mindMapNodes }))
               }
               onOpenInspector={() => setShowInspectorDrawer(true)}
+              onConvergeMindMap={handleExecuteConvergeMindMap}
+              isConverging={isConvergingMindMap}
+              onAddTodoFromNode={handleAddTodoFromNode}
             />
           </section>
 
-          {/* Column 3 (25% -> 3 cols): Actionable To-Do List */}
-          <section className="lg:col-span-3 h-full min-h-0 overflow-hidden">
-            <TodoColumn
-              todos={activeSession.todos}
-              onUpdateTodos={(todos) =>
-                updateActiveSession((prev) => ({ ...prev, todos }))
-              }
-            />
-          </section>
+          {/* Right Draggable Resizer Splitter */}
+          {!isRightColCollapsed && (
+            <div
+              onMouseDown={() => setIsDraggingRightResizer(true)}
+              onDoubleClick={() => {
+                setRightColWidthPercent(24);
+                try {
+                  localStorage.setItem('pulsenote_right_col_width', '24');
+                } catch {
+                  // ignore
+                }
+              }}
+              className={`hidden lg:flex flex-col items-center justify-center w-1.5 hover:w-2 bg-slate-200 hover:bg-blue-500 cursor-col-resize select-none relative group transition-all shrink-0 z-10 ${
+                isDraggingRightResizer ? 'w-2 bg-blue-600' : ''
+              }`}
+              title="按住拖曳調整右欄寬度；雙擊重設為 24%"
+            >
+              <div className="w-1 h-7 rounded-full bg-slate-400 group-hover:bg-white transition-colors" />
+            </div>
+          )}
+
+          {/* Column 3: Actionable To-Do List (Resizable Right Column or Collapsible) */}
+          {isRightColCollapsed ? (
+            <div
+              onClick={() => {
+                setIsRightColCollapsed(false);
+                try {
+                  localStorage.setItem('pulsenote_right_col_collapsed', 'false');
+                } catch {
+                  // ignore
+                }
+              }}
+              className="hidden lg:flex flex-col items-center justify-start py-4 px-1.5 bg-slate-100 hover:bg-slate-200 border-l border-slate-200 cursor-pointer transition-colors shrink-0 select-none group"
+              title="點擊展開待辦事項清單"
+            >
+              <div className="flex flex-col items-center gap-2">
+                <ChevronLeft className="w-4 h-4 text-slate-500 group-hover:text-blue-600 transition-colors" />
+                <span className="text-[11px] font-semibold text-slate-700 [writing-mode:vertical-rl] tracking-wider">
+                  展開待辦清單
+                </span>
+                <span className="px-1 py-0.5 text-[10px] font-mono-tabular bg-slate-300 text-slate-800 rounded-full">
+                  {activeSession.todos.length}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <section
+              style={{ width: `${rightColWidthPercent}%` }}
+              className="w-full lg:w-auto h-full min-h-0 overflow-hidden flex flex-col shrink-0 min-w-[220px] max-w-full lg:max-w-[45%] relative"
+            >
+              <TodoColumn
+                todos={activeSession.todos}
+                onUpdateTodos={(todos) =>
+                  updateActiveSession((prev) => ({ ...prev, todos }))
+                }
+              />
+              {/* Quick collapse button on right edge of todo column header */}
+              <button
+                type="button"
+                onClick={() => {
+                  setIsRightColCollapsed(true);
+                  try {
+                    localStorage.setItem('pulsenote_right_col_collapsed', 'true');
+                  } catch {
+                    // ignore
+                  }
+                }}
+                className="hidden lg:flex items-center justify-center absolute top-2.5 right-2.5 p-1 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors"
+                title="收合待辦清單，擴大心智圖畫布"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </section>
+          )}
         </main>
 
         {/* Right Drawer: Live Model Data Inspector */}
@@ -1251,6 +1919,131 @@ export default function App() {
                   <>
                     <Sparkles className="w-3.5 h-3.5" />
                     <span>立即補全此會議</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification for Correction */}
+      {correctionToast && (
+        <div className="fixed top-14 right-6 z-50 flex items-center gap-2 px-4 py-2.5 bg-emerald-600 text-white text-xs font-medium rounded-lg shadow-xl animate-fade-in">
+          <Check className="w-4 h-4 shrink-0" />
+          <span>{correctionToast}</span>
+        </div>
+      )}
+
+      {/* Modal: Conversational AI Error Correction */}
+      {showCorrectionModal && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="w-full max-w-xl bg-white rounded-xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+              <div className="flex items-center gap-2">
+                <Edit3 className="w-4 h-4 text-amber-700" />
+                <h3 className="text-sm font-semibold text-slate-900">
+                  跟 AI 對話修正錯詞與調整內容
+                </h3>
+              </div>
+              <button
+                onClick={handleCloseCorrectionModal}
+                className="p-1 text-slate-400 hover:text-slate-700 rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <p className="text-xs text-slate-600 leading-relaxed">
+                您可以像跟助理講話一樣，用<b>打字</b>或點擊右下方<b>麥克風直接說話</b>告訴 AI 要修正什麼。AI 會自動搜尋目前的<b>逐字稿、重點筆記、心智圖與待辦清單</b>並精準智慧替換：
+              </p>
+
+              {/* Quick suggestion prompt chips */}
+              <div className="space-y-1.5">
+                <span className="text-[11px] font-medium text-slate-400">
+                  常用指令範例（點擊可直接帶入）：
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    '把「建宏」全部修正為「建弘」',
+                    '心智圖的第二個主幹改名為「企業通訊閘道器」',
+                    '把待辦事項中建弘的任務期限改為「下週三」',
+                    '將逐字稿提到的「批批哀」更正為「PII 個資遮罩」',
+                  ].map((example, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      onClick={() => setCorrectionInstruction(example)}
+                      className="px-2.5 py-1 text-[11px] text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded transition-colors text-left"
+                    >
+                      {example}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="relative">
+                <textarea
+                  value={correctionInstruction}
+                  onChange={(e) => setCorrectionInstruction(e.target.value)}
+                  placeholder="例如：
+- 把所有的『林建宏』修正為『林建弘』
+- 心智圖架構那段的決策，把 200 改成 500
+- 待辦事項第二項的負責人換成『許庭瑜』..."
+                  rows={4}
+                  className="w-full p-3 pr-12 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-600 font-sans leading-relaxed"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={handleToggleVoiceCorrection}
+                  className={`absolute right-2.5 bottom-3 p-2 rounded-full transition-all ${
+                    isListeningVoiceCorrection
+                      ? 'bg-red-600 text-white animate-pulse ring-4 ring-red-200'
+                      : 'text-slate-400 hover:text-amber-800 hover:bg-amber-100'
+                  }`}
+                  title={
+                    isListeningVoiceCorrection
+                      ? '停止語音口述'
+                      : '點擊以語音說出修正指令（免打字）'
+                  }
+                >
+                  <Mic className="w-4 h-4" />
+                </button>
+              </div>
+
+              {isListeningVoiceCorrection && (
+                <div className="flex items-center gap-2 p-2 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+                  <span className="w-2.5 h-2.5 rounded-full bg-red-600 animate-ping shrink-0" />
+                  <span>
+                    正在聆聽您的語音指令... 請對著麥克風說話（如：「把建宏全部改成建弘」），完成後點擊右下角「執行對話修訂」。
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-3 bg-slate-50 border-t border-slate-200">
+              <button
+                onClick={handleCloseCorrectionModal}
+                className="px-3 py-1.5 text-xs text-slate-600 hover:text-slate-900"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => handleExecuteCorrection()}
+                disabled={isCorrecting || !correctionInstruction.trim()}
+                className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 disabled:opacity-50 rounded-lg transition-colors"
+              >
+                {isCorrecting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Gemini 全面校正替換中...</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>執行對話修訂</span>
                   </>
                 )}
               </button>

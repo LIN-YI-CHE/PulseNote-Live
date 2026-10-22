@@ -11,6 +11,12 @@ import {
   X,
   Code2,
   Layers,
+  GitMerge,
+  RefreshCw,
+  Info,
+  CheckSquare,
+  Copy,
+  BookOpen,
 } from 'lucide-react';
 import { MindMapNode } from '../types/meeting';
 
@@ -19,6 +25,9 @@ interface MindMapCanvasProps {
   onUpdateNodes: (nodes: MindMapNode[]) => void;
   meetingTitle: string;
   onOpenInspector?: () => void;
+  onConvergeMindMap?: () => Promise<void>;
+  isConverging?: boolean;
+  onAddTodoFromNode?: (task: string, priority?: 'high' | 'medium' | 'low') => void;
 }
 
 interface PositionedNode extends MindMapNode {
@@ -32,20 +41,33 @@ interface PositionedNode extends MindMapNode {
 
 const NODE_WIDTH = 224;
 const NODE_HEIGHT = 58;
-const LEVEL_GAP_X = 270;
-const SIBLING_GAP_Y = 76;
+const LEVEL_GAP_X = 290;
+const SIBLING_GAP_Y = 24;
+const ROW_HEIGHT = NODE_HEIGHT + SIBLING_GAP_Y; // 82px minimum vertical interval
 
 export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   nodes,
   onUpdateNodes,
   meetingTitle,
   onOpenInspector,
+  onConvergeMindMap,
+  isConverging = false,
+  onAddTodoFromNode,
 }) => {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [zoom, setZoom] = useState<number>(0.92);
-  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 50, y: 250 });
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 60, y: 300 });
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // Count Level 1 pillars directly connected to root
+  const level1PillarsCount = useMemo(() => {
+    return nodes.filter(
+      (n) =>
+        n.id !== 'root' &&
+        (n.parentId === 'root' || !n.parentId || n.parentId === 'NONE')
+    ).length;
+  }, [nodes]);
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>('root');
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
@@ -54,10 +76,51 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
     useState<MindMapNode['category']>('topic');
   const [editNotes, setEditNotes] = useState<string>('');
 
+  // Leaf Node Detailed View Modal State
+  const [detailNode, setDetailNode] = useState<PositionedNode | null>(null);
+  const [detailNotesText, setDetailNotesText] = useState<string>('');
+  const [isEditingNotesInDetail, setIsEditingNotesInDetail] = useState<boolean>(false);
+  const [copiedFeedback, setCopiedFeedback] = useState<boolean>(false);
+  const [addedTodoFeedback, setAddedTodoFeedback] = useState<boolean>(false);
+
+  // Helper to trace breadcrumb hierarchy path from root down to any target node
+  const getNodeBreadcrumbPath = (nodeId: string): MindMapNode[] => {
+    const pathList: MindMapNode[] = [];
+    let curr: MindMapNode | undefined = nodes.find((n) => n.id === nodeId);
+    const visited = new Set<string>();
+    while (curr && !visited.has(curr.id)) {
+      visited.add(curr.id);
+      pathList.unshift(curr);
+      if (!curr.parentId || curr.parentId === 'NONE' || curr.id === 'root') break;
+      curr = nodes.find((n) => n.id === curr!.parentId);
+    }
+    return pathList;
+  };
+
+  const handleSaveDetailNotes = (nodeId: string, newNotes: string) => {
+    onUpdateNodes(
+      nodes.map((n) =>
+        n.id === nodeId ? { ...n, notes: newNotes.trim() || undefined } : n
+      )
+    );
+    if (detailNode && detailNode.id === nodeId) {
+      setDetailNode({ ...detailNode, notes: newNotes.trim() || undefined });
+    }
+  };
+
+  const handleCopyNodeInfo = (node: PositionedNode) => {
+    const path = getNodeBreadcrumbPath(node.id).map((n) => n.label).join(' > ');
+    const text = `【心智圖節點】：${node.label}\n【所屬路徑】：${path}\n【節點屬性】：${node.category || '未分類'}\n${node.notes ? `【詳細備忘】：${node.notes}` : ''}`;
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedFeedback(true);
+      setTimeout(() => setCopiedFeedback(false), 2000);
+    });
+  };
+
   // Depth view mode: 'all' (3 levels) or 'l2' (only root + main topics)
   const [viewDepth, setViewDepth] = useState<'all' | 'l2'>('all');
 
-  // Compute deterministic tree layout
+  // Compute deterministic, collision-free hierarchical tree layout
   const { positionedNodes, edges, bounds } = useMemo(() => {
     if (!nodes || nodes.length === 0) {
       return {
@@ -71,19 +134,25 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       };
     }
 
-    // Normalize root node
+    // 1. Normalize root node
     const rootNode =
       nodes.find(
         (n) => n.id === 'root' || n.parentId === null || n.parentId === 'NONE'
       ) || nodes[0];
 
+    const nodeMap = new Map<string, MindMapNode>();
+    for (const n of nodes) {
+      nodeMap.set(n.id, n);
+    }
+
+    // 2. Build parent -> children map with cycle-prevention
     const childrenMap = new Map<string, MindMapNode[]>();
     for (const n of nodes) {
       if (n.id === rootNode.id) continue;
       const pid =
         !n.parentId ||
         n.parentId === 'NONE' ||
-        !nodes.some((item) => item.id === n.parentId)
+        !nodeMap.has(n.parentId)
           ? rootNode.id
           : n.parentId;
       const list = childrenMap.get(pid) || [];
@@ -91,61 +160,120 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       childrenMap.set(pid, list);
     }
 
-    const resultNodes: PositionedNode[] = [];
-    let currentLeafY = 0;
+    // 3. Pass 1: Compute Subtree Bounding Height for every node
+    const subtreeHeightMap = new Map<string, number>();
 
-    const traverse = (node: MindMapNode, depth: number): number => {
-      const children = childrenMap.get(node.id) || [];
-      // If viewDepth === 'l2', collapse anything at depth >= 1
+    const computeSubtreeHeight = (nodeId: string, depth: number): number => {
+      const children = childrenMap.get(nodeId) || [];
       const isForcedCollapsed = viewDepth === 'l2' && depth >= 1;
-      const effectiveCollapsed = node.collapsed || isForcedCollapsed;
-      const hasChildren = children.length > 0;
+      const nodeObj = nodeMap.get(nodeId);
+      const isCollapsed = Boolean(nodeObj?.collapsed || isForcedCollapsed);
+
+      if (children.length === 0 || isCollapsed) {
+        subtreeHeightMap.set(nodeId, ROW_HEIGHT);
+        return ROW_HEIGHT;
+      }
+
+      let totalChildHeight = 0;
+      for (const child of children) {
+        totalChildHeight += computeSubtreeHeight(child.id, depth + 1);
+      }
+      const height = Math.max(totalChildHeight, ROW_HEIGHT);
+      subtreeHeightMap.set(nodeId, height);
+      return height;
+    };
+
+    computeSubtreeHeight(rootNode.id, 0);
+
+    // 4. Pass 2: Position nodes by partitioning vertical space among subtrees
+    const resultNodes: PositionedNode[] = [];
+    const posMap = new Map<string, PositionedNode>();
+
+    const layoutSubtree = (
+      node: MindMapNode,
+      depth: number,
+      topY: number,
+      allocatedHeight: number
+    ) => {
+      const children = childrenMap.get(node.id) || [];
+      const isForcedCollapsed = viewDepth === 'l2' && depth >= 1;
+      const effectiveCollapsed = Boolean(node.collapsed || isForcedCollapsed);
+      const hasChildren = children.length > 0 && !effectiveCollapsed;
       const x = depth * LEVEL_GAP_X;
 
-      if (!hasChildren || effectiveCollapsed) {
-        const y = currentLeafY;
-        currentLeafY += SIBLING_GAP_Y;
-        resultNodes.push({
-          ...node,
-          x,
-          y,
-          depth,
-          width: NODE_WIDTH,
-          height: NODE_HEIGHT,
-          hasChildren,
-        });
-        return y;
+      let y: number;
+
+      if (!hasChildren) {
+        // Center leaf in its dedicated non-overlapping vertical slice
+        y = topY + allocatedHeight / 2;
+      } else {
+        // Distribute children into dedicated, contiguous vertical intervals
+        let childTop = topY;
+        const childYs: number[] = [];
+
+        for (const child of children) {
+          const childH = subtreeHeightMap.get(child.id) || ROW_HEIGHT;
+          layoutSubtree(child, depth + 1, childTop, childH);
+          const placedChild = posMap.get(child.id);
+          if (placedChild) {
+            childYs.push(placedChild.y);
+          }
+          childTop += childH;
+        }
+
+        // Center parent relative to its children span
+        if (childYs.length > 0) {
+          y = (childYs[0] + childYs[childYs.length - 1]) / 2;
+        } else {
+          y = topY + allocatedHeight / 2;
+        }
       }
 
-      const childYs: number[] = [];
-      for (const child of children) {
-        childYs.push(traverse(child, depth + 1));
-      }
-      const y = (childYs[0] + childYs[childYs.length - 1]) / 2;
-      resultNodes.push({
+      const pNode: PositionedNode = {
         ...node,
         x,
         y,
         depth,
         width: NODE_WIDTH,
         height: NODE_HEIGHT,
-        hasChildren,
-      });
-      return y;
+        hasChildren: children.length > 0,
+      };
+
+      resultNodes.push(pNode);
+      posMap.set(node.id, pNode);
     };
 
-    const rootY = traverse(rootNode, 0);
+    const totalRootHeight = subtreeHeightMap.get(rootNode.id) || ROW_HEIGHT;
+    layoutSubtree(rootNode, 0, 0, totalRootHeight);
 
-    // Center the tree vertically around y = 0
+    // 5. Pass 3: Per-depth Collision Relaxation Guarantee (eliminates any edge-case overlaps)
+    const depthGroups = new Map<number, PositionedNode[]>();
     for (const pn of resultNodes) {
-      pn.y -= rootY;
+      const list = depthGroups.get(pn.depth) || [];
+      list.push(pn);
+      depthGroups.set(pn.depth, list);
     }
 
-    const posMap = new Map<string, PositionedNode>();
-    for (const pn of resultNodes) {
-      posMap.set(pn.id, pn);
+    for (const [, list] of depthGroups) {
+      list.sort((a, b) => a.y - b.y);
+      for (let i = 1; i < list.length; i++) {
+        const prev = list[i - 1];
+        const curr = list[i];
+        if (curr.y - prev.y < ROW_HEIGHT) {
+          const shift = ROW_HEIGHT - (curr.y - prev.y);
+          curr.y += shift;
+        }
+      }
     }
 
+    // 6. Pass 4: Center tree vertically around root node y = 0
+    const rootPos = posMap.get(rootNode.id);
+    const offsetY = rootPos ? rootPos.y : 0;
+    for (const pn of resultNodes) {
+      pn.y -= offsetY;
+    }
+
+    // 7. Recompute clean directed edges
     const resultEdges: Array<{
       id: string;
       source: PositionedNode;
@@ -168,16 +296,17 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
       }
     }
 
+    // 8. Dynamic canvas bounds
     let minX = 0;
-    let maxX = 700;
-    let minY = -200;
-    let maxY = 200;
+    let maxX = 800;
+    let minY = -250;
+    let maxY = 250;
 
     if (resultNodes.length > 0) {
-      minX = Math.min(...resultNodes.map((n) => n.x)) - 40;
-      maxX = Math.max(...resultNodes.map((n) => n.x + n.width)) + 60;
-      minY = Math.min(...resultNodes.map((n) => n.y - n.height / 2)) - 60;
-      maxY = Math.max(...resultNodes.map((n) => n.y + n.height / 2)) + 60;
+      minX = Math.min(...resultNodes.map((n) => n.x)) - 60;
+      maxX = Math.max(...resultNodes.map((n) => n.x + n.width)) + 80;
+      minY = Math.min(...resultNodes.map((n) => n.y - n.height / 2)) - 80;
+      maxY = Math.max(...resultNodes.map((n) => n.y + n.height / 2)) + 80;
     }
 
     return {
@@ -392,22 +521,57 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
   return (
     <div className="flex flex-col h-full bg-[#F8FAFC] select-none relative overflow-hidden">
       {/* Column Header & Canvas Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-slate-200 shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <h2 className="text-sm font-semibold text-slate-900 whitespace-nowrap">
-            02. 三層架構心智圖
-          </h2>
-          <span className="text-xs text-slate-400" aria-hidden="true">
-            ·
-          </span>
-          <span className="text-xs text-slate-500 font-mono-tabular whitespace-nowrap">
-            {nodes.length} 節點
-          </span>
+      <div className="px-4 py-2.5 bg-white border-b border-slate-200 shrink-0">
+        {/* Row 1: Completely Independent Title Area */}
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <h2 className="text-sm font-bold text-slate-900 tracking-tight whitespace-nowrap">
+              三層架構心智圖
+            </h2>
+            <span className="px-2 py-0.5 text-[11px] font-semibold text-slate-600 bg-slate-100 rounded-full font-mono-tabular shrink-0">
+              {level1PillarsCount} 主柱 · {nodes.length} 節點
+            </span>
+            {level1PillarsCount > 4 && (
+              <span
+                className="px-2 py-0.5 text-[10.5px] font-medium bg-amber-100 text-amber-800 rounded-full whitespace-nowrap animate-pulse shrink-0"
+                title="第一階分支超過 4 支，建議點擊下方「智慧收斂主幹」"
+              >
+                主幹偏多 (建議收斂)
+              </span>
+            )}
+          </div>
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        {/* Row 2: Action Buttons Bar (Responsive flex-wrap, clean layout) */}
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {/* Smart Convergence Button */}
+          {onConvergeMindMap && (
+            <button
+              onClick={() => onConvergeMindMap()}
+              disabled={isConverging || nodes.length <= 2}
+              className={`flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded transition-all whitespace-nowrap shrink-0 shadow-2xs ${
+                level1PillarsCount > 4
+                  ? 'bg-amber-600 hover:bg-amber-700 text-white ring-2 ring-amber-300'
+                  : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+              } disabled:opacity-50`}
+              title="一鍵智慧收斂：AI 會自動將散落的第一階分支聚類為 3~4 個核心支柱，消除重複並聚合相同議題"
+            >
+              {isConverging ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  <span>AI 收斂聚合中...</span>
+                </>
+              ) : (
+                <>
+                  <GitMerge className="w-3.5 h-3.5" />
+                  <span>智慧收斂主幹</span>
+                </>
+              )}
+            </button>
+          )}
+
           {/* Depth View Filter Toggle */}
-          <div className="flex items-center bg-slate-100 p-0.5 rounded text-xs font-medium text-slate-600">
+          <div className="flex items-center bg-slate-100 p-0.5 rounded text-xs font-medium text-slate-600 shrink-0">
             <button
               onClick={() => setViewDepth('all')}
               className={`px-2 py-0.5 rounded transition-colors whitespace-nowrap ${
@@ -453,7 +617,7 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
           {onOpenInspector && (
             <button
               onClick={onOpenInspector}
-              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors whitespace-nowrap shrink-0"
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200/60 rounded transition-colors whitespace-nowrap shrink-0 ml-auto"
               title="查看 Gemini 3.8 Live 呼叫工具的原始 JSON 數據"
             >
               <Code2 className="w-3.5 h-3.5" />
@@ -579,6 +743,12 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
                   onClick={(e) => {
                     e.stopPropagation();
                     setSelectedNodeId(node.id);
+                    // Leaf node clicked: pop up detail modal!
+                    if (!node.hasChildren) {
+                      setDetailNode(node);
+                      setDetailNotesText(node.notes || '');
+                      setIsEditingNotesInDetail(false);
+                    }
                   }}
                   onDoubleClick={(e) => handleStartEdit(node, e)}
                   className="cursor-pointer"
@@ -659,6 +829,40 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
                       </text>
                     </g>
                   )}
+
+                  {/* Leaf Node "詳情 ⤢" indicator badge */}
+                  {!node.hasChildren && node.id !== 'root' && (
+                    <g
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedNodeId(node.id);
+                        setDetailNode(node);
+                        setDetailNotesText(node.notes || '');
+                        setIsEditingNotesInDetail(false);
+                      }}
+                      transform={`translate(${node.width - 44}, 6)`}
+                      className="opacity-75 hover:opacity-100 transition-opacity"
+                    >
+                      <rect
+                        width={36}
+                        height={15}
+                        rx={3.5}
+                        fill={style.subFill}
+                        fillOpacity={0.16}
+                      />
+                      <text
+                        x={18}
+                        y={11}
+                        textAnchor="middle"
+                        fill={style.subFill}
+                        fontSize={9}
+                        fontWeight={700}
+                        fontFamily="Plus Jakarta Sans, sans-serif"
+                      >
+                        詳情 ⤢
+                      </text>
+                    </g>
+                  )}
                 </g>
               );
             })}
@@ -676,6 +880,38 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
                 ({nodes.find((n) => n.id === selectedNodeId)?.notes})
               </span>
             )}
+            <span aria-hidden="true" className="text-slate-300">
+              ·
+            </span>
+            <button
+              onClick={() => {
+                const target =
+                  positionedNodes.find((n) => n.id === selectedNodeId) ||
+                  nodes.find((n) => n.id === selectedNodeId);
+                if (target) {
+                  const pNode: PositionedNode =
+                    (target as any).hasChildren !== undefined
+                      ? (target as PositionedNode)
+                      : {
+                          ...target,
+                          x: 0,
+                          y: 0,
+                          depth: 1,
+                          width: NODE_WIDTH,
+                          height: NODE_HEIGHT,
+                          hasChildren: false,
+                        };
+                  setDetailNode(pNode);
+                  setDetailNotesText(target.notes || '');
+                  setIsEditingNotesInDetail(false);
+                }
+              }}
+              className="flex items-center gap-1 text-blue-600 hover:text-blue-800 font-semibold whitespace-nowrap"
+              title="查看此卡片詳細資訊與決策背景"
+            >
+              <Info className="w-3.5 h-3.5" />
+              <span>詳細資訊</span>
+            </button>
             <span aria-hidden="true" className="text-slate-300">
               ·
             </span>
@@ -743,6 +979,196 @@ export const MindMapCanvas: React.FC<MindMapCanvasProps> = ({
             <Maximize2 className="w-3.5 h-3.5" />
           </button>
         </div>
+
+        {/* Leaf Node Detailed Information Modal */}
+        {detailNode && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs animate-in fade-in duration-150"
+            onClick={() => setDetailNode(null)}
+          >
+            <div
+              className="bg-white rounded-xl shadow-2xl border border-slate-200 max-w-lg w-full overflow-hidden flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal Header */}
+              <div className="flex items-start justify-between p-4 border-b border-slate-100 bg-slate-50/70">
+                <div className="space-y-1.5 min-w-0 pr-2">
+                  {/* Breadcrumb Hierarchy Path */}
+                  <div className="flex items-center gap-1 text-[11px] text-slate-500 font-medium flex-wrap">
+                    {getNodeBreadcrumbPath(detailNode.id).map((step, idx, arr) => (
+                      <React.Fragment key={step.id}>
+                        <span
+                          className={
+                            idx === arr.length - 1
+                              ? 'font-bold text-blue-700'
+                              : 'text-slate-600'
+                          }
+                        >
+                          {step.label}
+                        </span>
+                        {idx < arr.length - 1 && (
+                          <span className="text-slate-300">/</span>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`px-2 py-0.5 text-xs font-semibold rounded-full ${
+                        detailNode.category === 'decision'
+                          ? 'bg-blue-100 text-blue-800'
+                          : detailNode.category === 'action'
+                          ? 'bg-amber-100 text-amber-800'
+                          : detailNode.category === 'detail'
+                          ? 'bg-slate-100 text-slate-700'
+                          : 'bg-emerald-100 text-emerald-800'
+                      }`}
+                    >
+                      {detailNode.category === 'decision'
+                        ? '關鍵決策 (Level 3)'
+                        : detailNode.category === 'action'
+                        ? '待執行項目 (Level 3)'
+                        : detailNode.category === 'detail'
+                        ? '補充細節 (Level 3)'
+                        : '核心主幹'}
+                    </span>
+                    <span className="text-xs text-slate-400">·</span>
+                    <span className="text-xs text-slate-500">
+                      末端節點 (卡片詳細資訊)
+                    </span>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => setDetailNode(null)}
+                  className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 rounded-lg transition-colors shrink-0"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Modal Body */}
+              <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+                {/* Node Title */}
+                <div>
+                  <label className="block text-xs font-semibold text-slate-500 mb-1">
+                    節點主題名稱
+                  </label>
+                  <div className="text-base font-bold text-slate-900 leading-snug">
+                    {detailNode.label}
+                  </div>
+                </div>
+
+                {/* Detailed Notes / Context */}
+                <div className="p-3.5 bg-slate-50 rounded-lg border border-slate-200/80 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                      <BookOpen className="w-3.5 h-3.5 text-blue-600" />
+                      詳細補充與決策脈絡
+                    </span>
+                    {!isEditingNotesInDetail && (
+                      <button
+                        onClick={() => setIsEditingNotesInDetail(true)}
+                        className="text-xs font-medium text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                      >
+                        <Edit3 className="w-3 h-3" />
+                        編輯備忘
+                      </button>
+                    )}
+                  </div>
+
+                  {isEditingNotesInDetail ? (
+                    <div className="space-y-2 pt-1">
+                      <textarea
+                        value={detailNotesText}
+                        onChange={(e) => setDetailNotesText(e.target.value)}
+                        placeholder="輸入此節點的詳細背景、決策細節或備忘..."
+                        rows={3}
+                        className="w-full text-xs p-2 bg-white border border-blue-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-600 text-slate-800"
+                        autoFocus
+                      />
+                      <div className="flex justify-end gap-1.5">
+                        <button
+                          onClick={() => {
+                            setDetailNotesText(detailNode.notes || '');
+                            setIsEditingNotesInDetail(false);
+                          }}
+                          className="px-2.5 py-1 text-xs text-slate-600 hover:bg-slate-200 rounded"
+                        >
+                          取消
+                        </button>
+                        <button
+                          onClick={() => {
+                            handleSaveDetailNotes(
+                              detailNode.id,
+                              detailNotesText
+                            );
+                            setIsEditingNotesInDetail(false);
+                          }}
+                          className="px-2.5 py-1 text-xs text-white bg-blue-600 hover:bg-blue-700 rounded font-medium"
+                        >
+                          儲存備忘
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-700 leading-relaxed font-normal">
+                      {detailNode.notes ? (
+                        detailNode.notes
+                      ) : (
+                        <span className="text-slate-400 italic">
+                          本節點尚無額外補充筆記。可點擊右上角「編輯備忘」補充執行依據或技術細節。
+                        </span>
+                      )}
+                    </p>
+                  )}
+                </div>
+
+                {/* Action Buttons Row */}
+                <div className="flex items-center gap-2 pt-1 flex-wrap">
+                  {onAddTodoFromNode && (
+                    <button
+                      onClick={() => {
+                        onAddTodoFromNode(
+                          detailNode.label,
+                          detailNode.category === 'action' ? 'high' : 'medium'
+                        );
+                        setAddedTodoFeedback(true);
+                        setTimeout(() => setAddedTodoFeedback(false), 2000);
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors shadow-2xs"
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>
+                        {addedTodoFeedback ? '已加入待辦清單 ✓' : '轉為行動待辦事項'}
+                      </span>
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => handleCopyNodeInfo(detailNode)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors"
+                  >
+                    <Copy className="w-3.5 h-3.5 text-slate-500" />
+                    <span>{copiedFeedback ? '已複製內容 ✓' : '複製節點內容'}</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      handleAddChildNode(detailNode.id);
+                      setDetailNode(null);
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg transition-colors"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-slate-500" />
+                    <span>延伸子分支</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -115,13 +115,10 @@ export const TodoColumn: React.FC<TodoColumnProps> = ({
       {/* Column Header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-200 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <h2 className="text-sm font-semibold text-slate-900 whitespace-nowrap">
-            03. 待辦事項清單
+          <h2 className="text-sm font-bold text-slate-900 tracking-tight whitespace-nowrap">
+            待辦事項清單
           </h2>
-          <span className="text-xs text-slate-400" aria-hidden="true">
-            ·
-          </span>
-          <span className="text-xs text-slate-500 font-mono-tabular whitespace-nowrap">
+          <span className="px-2 py-0.5 text-[11px] font-semibold text-slate-600 bg-slate-100 rounded-full font-mono-tabular shrink-0">
             {pendingCount} 待辦 / {completedCount} 完成
           </span>
         </div>
@@ -191,7 +188,7 @@ export const TodoColumn: React.FC<TodoColumnProps> = ({
             type="text"
             value={newAssignee}
             onChange={(e) => setNewAssignee(e.target.value)}
-            placeholder="負責人 (例: 林建宏)"
+            placeholder="負責人 (例: 架構組)"
             className="w-28 px-2 py-1 text-xs bg-slate-50 border border-slate-200 rounded text-slate-700 focus:outline-none focus:border-blue-600"
           />
           <select

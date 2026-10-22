@@ -7,19 +7,19 @@ export interface SimulatedDialogueTurn {
 
 export const SIMULATED_MEETING_SCRIPT: SimulatedDialogueTurn[] = [
   {
-    speaker: '產品總監 陳雅婷',
-    text: '各位好，今天我們聚焦在 Q4 智慧客服語音平台的改版計畫。核心目標是導入 Gemini 3.8 Live 模型，將端到端語音回應延遲壓低到 500 毫秒以內，並且在十一月中旬前完成企業客戶封測。請架構組的林建宏先在本週五前產出雙向 WebSocket 音訊閘道器的壓力測試報告。',
+    speaker: '產品負責人',
+    text: '各位好，今天我們聚焦在 Q4 智慧客服語音平台的改版計畫。核心目標是導入 Gemini 3.8 Live 模型，將端到端語音回應延遲壓低到 500 毫秒以內，並且在十一月中旬前完成企業客戶封測。請技術架構小組先在本週五前產出雙向 WebSocket 音訊閘道器的壓力測試報告。',
   },
   {
-    speaker: '首席架構師 林建宏',
-    text: '收到。目前音訊串流統一採用 16kHz PCM 格式上傳，為了確保高併發穩定度，我們決定在 Cloud Run 前端加上自動擴展策略，單一節點上限設為 200 條即時連線。另外，我需要後端工程師張哲維在 10 月 25 日前完成 Tool Calling 訂單查詢 API 的重構與逾時保護機制。',
+    speaker: '系統架構師',
+    text: '收到。目前音訊串流統一採用 16kHz PCM 格式上傳，為了確保高併發穩定度，我們決定在 Cloud Run 前端加上自動擴展策略，單一節點上限設為 200 條即時連線。另外，需要後端工程小組在 10 月 25 日前完成 Tool Calling 訂單查詢 API 的重構與逾時保護機制。',
   },
   {
-    speaker: '設計主管 許庭瑜',
+    speaker: 'UI 設計師',
     text: '在前端介面部分，企業客服人員反映希望通話時不要跳出彈窗干擾，所以我們決議採用三欄式工作台：左側即時顯示語音逐字稿與客戶情緒摘要，中間動態展開問題診斷心智圖，右側則是自動勾稽的售後工單待辦。我會在下週二前交付新版 Figma 互動原型。',
   },
   {
-    speaker: '資安顧問 吳柏翰',
+    speaker: '資安工程師',
     text: '補充一點合規要求：所有通話錄音與即時轉錄文字在存入資料庫前，必須先經過敏感個資遮罩（PII Masking），把信用卡號與身分證字號自動替換掉。這部分請資安小組在下週三前完成自動化過濾規則的驗證。',
   },
 ];
@@ -34,14 +34,14 @@ export const INITIAL_MEETING_SESSIONS: MeetingSession[] = [
     transcripts: [
       {
         id: 'tr-1',
-        speaker: '產品總監 陳雅婷',
+        speaker: '產品負責人',
         text: '今天我們主要確認 Q4 產品路線圖，特別是即時語音會議工作台的核心架構與上線時程。',
         timestamp: '14:01:12',
         isFinal: true,
       },
       {
         id: 'tr-2',
-        speaker: '首席架構師 林建宏',
+        speaker: '系統架構師',
         text: '我們已經完成 Gemini 3.8 Live 的雙向音訊串流驗證，使用 16kHz PCM 搭配 Function Calling 可以同步更新心智圖與待辦事項，且不會播放多餘語音干擾會議。',
         timestamp: '14:02:45',
         isFinal: true,
@@ -50,7 +50,7 @@ export const INITIAL_MEETING_SESSIONS: MeetingSession[] = [
     notes: [
       {
         id: 'topic-1',
-        topic: '01. 核心架構與即時語音技術選型',
+        topic: '核心架構與即時語音技術選型',
         summary:
           '確立採用 Gemini 3.8 Live 模型作為即時聽寫與結構化引擎，透過 16kHz PCM 音訊串流與 Function Calling 同步輸出會議摘要、心智圖與行動清單。',
         keyDecisions: [
@@ -115,7 +115,7 @@ export const INITIAL_MEETING_SESSIONS: MeetingSession[] = [
       {
         id: 'todo-1',
         task: '完成雙向 WebSocket 音訊串流閘道器壓力測試報告',
-        assignee: '林建宏',
+        assignee: '技術架構組',
         priority: 'high',
         dueDate: '本週五',
         completed: false,
