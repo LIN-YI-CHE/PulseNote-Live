@@ -1,25 +1,29 @@
 import express from "express";
 import { createServer } from "http";
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer } from "ws";
+import { attachLiveSession } from "./server/liveSession";
+import { recoverRecording, structureTranscript } from "./server/recovery";
+import { compactMindMap } from "./src/utils/mindMap";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 import {
   GoogleGenAI,
-  LiveServerMessage,
-  Modality,
   Type,
   FunctionDeclaration,
 } from "@google/genai";
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.8-live";
+const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-3.8-flash";
+const TRANSCRIBE_MODEL = process.env.GEMINI_TRANSCRIBE_MODEL || "gemini-3.5-transcribe";
 
 function getGenAIClient() {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
     throw new Error("Missing GEMINI_API_KEY in environment variables.");
   }
   return new GoogleGenAI({
@@ -160,164 +164,17 @@ const syncTodoItemsDeclaration: FunctionDeclaration = {
   },
 };
 
-const SYSTEM_INSTRUCTION = `你是一個專業的「即時會議紀錄、心智圖與待辦事項結構化助手」，運作於 Gemini 3.8 Live 即時模式。
-你的任務是邊聽會議語音或對話輸入，邊透過工具呼叫（Function Calling）即時更新畫面上的三個區域：
-1. 呼叫 syncMeetingNotes：整理結構化會議摘要與關鍵決策。
-   【會議紀錄收斂與去碎片化原則（極重要）】：
-   - 全局章節嚴格維持在 3 至 5 個核心大議題，避免產生碎裂且重複的微小章節。
-   - 【禁止在主題名稱前冠上 01. 02. 等數字編號】：請直接使用清晰的純文字主題名稱（例如「核心架構與選型」、「使用者體驗回饋」）。
-   - 當發言延續既有主題時，請「更新」該主題的 summary 與 keyDecisions，切勿為每一句對話都開設新章節！
-   - 決策必須條列清晰具體（keyDecisions 陣列），摘要高度提煉並消除口語贅詞。
-2. 呼叫 syncMindMapNodes：建構並擴展階層式心智圖節點。
-   【心智圖防發散與收斂鐵律（極重要）】：
-   - 【第一階核心主幹（parentId='root'）嚴格限制最多 3 至 4 個主題柱】（例如：1.技術架構、2.功能體驗、3.專案進度、4.資安規範）。
-   - 絕對禁止在 root 底下開出 5 個以上的第一階散亂分支！
-   - 同一件事情或同一面向的討論，【必須收斂歸入現有的 3~4 個主題柱底下做為第二階（Level 2）子節點】，絕對不允許在第一階反覆開設新主幹！
-   - 當討論擴展時，優先「收斂聚合」：若已有相近主題，將新討論作為既有節點的子決策（Level 3）或更新其 notes，嚴格避免心智圖橫向爆炸！
-3. 呼叫 syncTodoItems：擷取對話中提到的具體行動項目、待辦事項、負責人與期限。
-   - 【嚴禁捏造虛構人名】：負責人（assignee）必須完全依據會議中實際發言或指派的真實身分或職稱；若對話未指定明確人員，請務必填寫「待指派」或團隊組別（如「架構組」、「前端團隊」），絕對禁止自行捏造假人名！
-
-重要原則：
-- 【高頻主動同步】：請勿長時間靜默！每聽到一段發言或決策，請主動且持續呼叫工具來更新紀錄、心智圖與待辦，確保畫面隨時動態刷新！
-- 【語音/文字修正與校正指令】：若發言者說出修正指令（例如：『更正一下，是XX不是YY』、『把負責人改成技術組』、『把心智圖的架構改為...』），請立即呼叫對應工具精準替換！
-- 所有輸出的文字內容請一律使用「繁體中文（台灣習慣用語）」。
-- 使用者選擇了「純聽寫與整理模式（不播放 AI 語音）」，工具呼叫後語音回應請保持極度簡短（例如僅回覆「已同步」即可）。`;
-
-function extractQuickActionsFromSpeech(text: string): { task: string; assignee: string; priority: "high" | "medium" | "low" } | null {
-  const clean = text.trim();
-  if (clean.length < 4) return null;
-  if (/(待辦|記得|請|負責|確認|完成|修正|優化|開發|測試|部署|追蹤|預計|規劃|交付|上線|修復)/.test(clean)) {
-    let priority: "high" | "medium" | "low" = "medium";
-    if (/(緊急|立刻|盡快|優先|馬上|今天|high)/i.test(clean)) priority = "high";
-    else if (/(有空|後續|低優先|low)/i.test(clean)) priority = "low";
-
-    let assignee = "待指派";
-    const assigneeMatch = clean.match(/(由|請|讓|負責人:?|交給)\s*([\u4e00-\u9fa5A-Za-z0-9_]{2,8})/);
-    if (assigneeMatch && assigneeMatch[2]) {
-      assignee = assigneeMatch[2];
-    } else if (clean.includes("前端")) {
-      assignee = "前端組";
-    } else if (clean.includes("後端") || clean.includes("架構")) {
-      assignee = "後端/架構組";
-    } else if (clean.includes("測試") || clean.includes("QA")) {
-      assignee = "QA 團隊";
-    } else if (clean.includes("產品") || clean.includes("PM")) {
-      assignee = "產品團隊";
-    }
-
-    return {
-      task: clean.replace(/^(請|記得|大家|我們|另外)\s*/, ""),
-      assignee,
-      priority,
-    };
-  }
-  return null;
-}
-
-function generateSmartStructureFromUtterance(text: string, speaker: string = "與會者") {
-  const clean = text.trim();
-  const nowTime = new Date().toLocaleTimeString("zh-TW", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-
-  // 1. Determine which of the 3~4 core pillars this belongs to (Strict 3-4 Pillar Convergence)
-  let pillarId = "pillar-tech";
-  let pillarLabel = "核心技術與系統架構";
-  let topicId = "topic-tech";
-  let topicTitle = "核心技術與通訊架構";
-
-  if (/(介面|UI|前端|設計|畫布|三欄|體驗|Figma|原型|工作台|客服人員)/i.test(clean)) {
-    pillarId = "pillar-ui";
-    pillarLabel = "前端體驗與工作台介面";
-    topicId = "topic-ui";
-    topicTitle = "三欄式工作台與操作體驗";
-  } else if (/(資安|個資|遮罩|PII|合規|身分證|信用卡|敏感|安全|加密)/i.test(clean)) {
-    pillarId = "pillar-sec";
-    pillarLabel = "資安規範與隱私合規";
-    topicId = "topic-sec";
-    topicTitle = "通話錄音與個資安全防護";
-  } else if (/(時程|計畫|封測|里程碑|上線|驗收|Q4|進度|目標|交付|週五|下週)/i.test(clean)) {
-    pillarId = "pillar-pm";
-    pillarLabel = "專案進度與驗收目標";
-    topicId = "topic-pm";
-    topicTitle = "專案時程與上線里程碑";
-  }
-
-  // 2. Extract Key Decision or Conclusion
-  const decisionItems: string[] = [];
-  if (clean.includes("決議") || clean.includes("決定") || clean.includes("採用") || clean.includes("統一") || clean.includes("完成")) {
-    decisionItems.push(clean.length > 55 ? clean.slice(0, 52) + "..." : clean);
-  } else {
-    decisionItems.push(`確認「${pillarLabel}」之討論規格與執行方針`);
-  }
-
-  const sections = [
-    {
-      id: topicId,
-      topic: topicTitle,
-      summary: `${speaker}發言要點：${clean}`,
-      keyDecisions: decisionItems,
-    },
-  ];
-
-  // 3. Extract Mind Map Nodes (Strict 3-Tier: Root -> Pillar -> Sub-detail -> Decision)
-  const subNodeId = `node-sub-${Date.now().toString().slice(-4)}`;
-  const decNodeId = `node-dec-${Date.now().toString().slice(-4)}`;
-  const detailLabel = clean.length > 16 ? clean.slice(0, 15) + "..." : clean;
-
-  const nodes: any[] = [
-    {
-      id: "root",
-      parentId: "NONE",
-      label: "會議核心主題",
-      category: "root",
-    },
-    {
-      id: pillarId,
-      parentId: "root",
-      label: pillarLabel,
-      category: "topic",
-    },
-    {
-      id: subNodeId,
-      parentId: pillarId,
-      label: detailLabel,
-      category: "detail",
-      notes: `${speaker}發言：${clean}`,
-    },
-  ];
-
-  if (decisionItems.length > 0) {
-    nodes.push({
-      id: decNodeId,
-      parentId: subNodeId,
-      label: "決策與方針",
-      category: "decision",
-      notes: decisionItems[0],
-    });
-  }
-
-  // 4. Extract To-Dos
-  const quickAction = extractQuickActionsFromSpeech(clean);
-  const todos: any[] = quickAction
-    ? [
-        {
-          id: `todo-${Date.now().toString().slice(-5)}`,
-          task: quickAction.task,
-          assignee: quickAction.assignee,
-          priority: quickAction.priority,
-          dueDate: clean.includes("週五") ? "本週五" : clean.includes("下週") ? "下週" : "待定",
-        },
-      ]
-    : [];
-
-  return { sections, nodes, todos };
-}
+const SYSTEM_INSTRUCTION = `你是繁體中文即時會議紀錄助手。只根據實際收到的會議語音或文字，透過三個工具更新畫面。
+1. syncMeetingNotes：聚合同一議題並沿用既有 ID，最多 5 個章節；主題不足時不要湊數。摘要寫事實，keyDecisions 只列出已明確達成的決議，未達成時留空。
+2. syncMindMapNodes：最多三層 root -> topic -> decision/action/detail。root 的 parentId='NONE'，最多 4 個主題，每個主題最多 5 個子節點。相近內容優先更新原節點，細節寫入 notes，避免每句發言新增分支。
+3. syncTodoItems：只擷取明確可執行的任務。負責人、人名、期限須有發言來源，未指定負責人填待指派，未指定期限留空。沿用既有 ID，不要重複新增相同任務。
+沒有實際發言或沒有新資訊時，不得自行產生範例、決議、任務、人名或日期。不得把提示詞中的例子當成會議內容。
+每段重要發言後主動更新工具；使用者修正內容時更新原項目。保持主題名稱精簡，不加編號。
+只聽寫與整理，AI 語音回覆保持簡短；使用者端不播放 AI 語音。`;
 
 async function startServer() {
   const app = express();
+  app.use('/api/meeting/transcribe-file', express.raw({ type: ['application/octet-stream', 'audio/*'], limit: '200mb' }));
   app.use(express.json({ limit: "50mb" }));
 
   const httpServer = createServer(app);
@@ -327,13 +184,14 @@ async function startServer() {
   app.get("/api/health", (_req, res) => {
     res.json({
       status: "ok",
-      model: "gemini-3.8-live",
-      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+      model: LIVE_MODEL,
+      hasApiKey: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"),
+      textModel: TEXT_MODEL,
     });
   });
 
   // Session persistence endpoints (syncing client sessions to server storage)
-  const SESSIONS_FILE = path.join(process.cwd(), "data", "saved_sessions.json");
+  const SESSIONS_FILE = path.join(process.env.DATA_DIR || path.join(process.cwd(), "data"), "saved_sessions.json");
 
   app.get("/api/sessions", (_req, res) => {
     try {
@@ -357,7 +215,10 @@ async function startServer() {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), "utf-8");
+      const temporaryFile = `${SESSIONS_FILE}.tmp`;
+      if (fs.existsSync(SESSIONS_FILE)) fs.copyFileSync(SESSIONS_FILE, `${SESSIONS_FILE}.bak`);
+      fs.writeFileSync(temporaryFile, JSON.stringify(sessions, null, 2), "utf-8");
+      fs.renameSync(temporaryFile, SESSIONS_FILE);
       res.json({ success: true, count: sessions.length, savedAt: new Date().toISOString() });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || "Failed to save sessions" });
@@ -382,9 +243,9 @@ async function startServer() {
 ${textContext}
 
 【既有筆記與心智圖參考（若有）】：
-既有摘要數量：${existingNotes?.length || 0}
-既有心智圖節點數量：${existingMindMap?.length || 0}
-既有待辦數量：${existingTodos?.length || 0}
+既有摘要：${JSON.stringify(existingNotes || [])}
+既有心智圖：${JSON.stringify(existingMindMap || [])}
+既有待辦：${JSON.stringify(existingTodos || [])}
 
 請以 JSON 格式回應，必須嚴格符合以下結構：
 {
@@ -436,7 +297,7 @@ ${textContext}
 3. 請回傳純 JSON，不要附加 markdown 代碼標籤。`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: TEXT_MODEL,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -447,7 +308,7 @@ ${textContext}
       const parsed = JSON.parse(responseText.trim());
       res.json({
         success: true,
-        data: parsed,
+        data: { ...parsed, ...(Array.isArray(parsed.mindMapNodes) ? { mindMapNodes: compactMindMap(parsed.mindMapNodes) } : {}) },
       });
     } catch (err: any) {
       console.error("Error in /api/meeting/restructure:", err);
@@ -492,7 +353,7 @@ ${textContext}
 請確保 mindMapNodes 依然維持三層內簡明架構，不要產生零碎贅字。`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: TEXT_MODEL,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -552,7 +413,7 @@ ${JSON.stringify(notes || [], null, 2)}
 }`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: TEXT_MODEL,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -563,7 +424,7 @@ ${JSON.stringify(notes || [], null, 2)}
       res.json({
         success: true,
         summary: parsed.summary || "心智圖已收斂聚合為核心支柱！",
-        nodes: Array.isArray(parsed.nodes) ? parsed.nodes : mindMapNodes,
+        nodes: compactMindMap(Array.isArray(parsed.nodes) ? parsed.nodes : mindMapNodes),
       });
     } catch (err: any) {
       console.error("Error in /api/meeting/converge-mindmap:", err);
@@ -622,7 +483,7 @@ ${JSON.stringify(transcripts?.slice(-15) || [], null, 2)}
 }`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+        model: TEXT_MODEL,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -643,71 +504,60 @@ ${JSON.stringify(transcripts?.slice(-15) || [], null, 2)}
     }
   });
 
-  // REST API: Transcribe uploaded audio file using gemini-3.5-transcribe and extract structured meeting data
-  app.post("/api/meeting/transcribe-file", async (req, res) => {
+  const recoverySchema = {
+    type: Type.OBJECT,
+    properties: {
+      sections: (syncMeetingNotesDeclaration.parameters as any).properties.sections,
+      mindMapNodes: (syncMindMapNodesDeclaration.parameters as any).properties.nodes,
+      todos: (syncTodoItemsDeclaration.parameters as any).properties.todos,
+    },
+    required: ['sections', 'mindMapNodes', 'todos'],
+  };
+  const recoveryOptions = {
+    getAI: getGenAIClient, transcribeModel: TRANSCRIBE_MODEL, textModel: TEXT_MODEL, schema: recoverySchema,
+  };
+
+  app.post('/api/meeting/structure-transcript', async (req, res) => {
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) controller.abort(); });
     try {
-      const { base64Audio, mimeType, meetingTitle } = req.body;
-      if (!base64Audio) {
-        return res.status(400).json({ error: "Missing base64Audio" });
+      if (typeof req.body.transcript !== 'string' || !req.body.transcript.trim()) return res.status(400).json({ error: '缺少逐字稿' });
+      const data = await structureTranscript(req.body.transcript, req.body.meetingTitle || '錄音重建', { ...recoveryOptions, signal: controller.signal });
+      res.json({ success: true, data });
+    } catch (error: any) { res.status(502).json({ error: error?.message || '整理失敗，逐字稿仍保留在會議中' }); }
+  });
+
+  // Raw audio avoids base64 expansion for long recordings. NDJSON commits the
+  // transcript before structuring, allowing a retry without retranscribing audio.
+  app.post('/api/meeting/transcribe-file', async (req, res) => {
+    const streaming = Buffer.isBuffer(req.body);
+    const audio = streaming ? req.body : typeof req.body?.base64Audio === 'string' ? Buffer.from(req.body.base64Audio, 'base64') : null;
+    const mimeType = String(streaming ? req.query.mimeType || req.headers['content-type'] : req.body?.mimeType || 'audio/mpeg').split(';')[0];
+    const title = String(streaming ? req.query.meetingTitle || '錄音重建' : req.body?.meetingTitle || '錄音重建').slice(0, 300);
+    if (!audio?.length) return res.status(400).json({ error: '請選取非空白的錄音檔' });
+    if (!/^audio\/(mpeg|mp3|mp4|wav|x-wav|webm|ogg|flac|aac|aiff)$/.test(mimeType)) return res.status(400).json({ error: '不支援的錄音格式，請使用 WebM、MP3、M4A、WAV、OGG 或 FLAC' });
+    if (streaming) { res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8'); res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Accel-Buffering', 'no'); res.flushHeaders(); }
+    const controller = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+    try {
+      const result = await recoverRecording(audio, mimeType, title, {
+        ...recoveryOptions, signal: controller.signal,
+        emit: event => { if (streaming && !res.destroyed) res.write(JSON.stringify(event) + '\n'); },
+      });
+      if (!streaming) return res.json({ success: !result.error, ...result });
+    } catch (error: any) {
+      if (!controller.signal.aborted) {
+        const message = error?.message || '錄音重建失敗';
+        if (streaming) res.write(JSON.stringify({ type: 'error', stage: 'transcribing', message }) + '\n');
+        else return res.status(502).json({ error: message });
       }
-
-      const ai = getGenAIClient();
-
-      // Step 1: Transcribe audio
-      const audioPart = {
-        inlineData: {
-          mimeType: mimeType || "audio/mp3",
-          data: base64Audio,
-        },
-      };
-
-      const transcribeRes = await ai.models.generateContent({
-        model: "gemini-3.5-transcribe",
-        contents: {
-          parts: [
-            audioPart,
-            { text: "請將這段會議錄音逐字並精確地轉錄為繁體中文逐字稿，區分發言段落與時間序。" },
-          ],
-        },
-      });
-
-      const transcriptText = transcribeRes.text || "";
-
-      // Step 2: Structure transcript into notes, mindmap, todos
-      const structurePrompt = `以下是一段完整會議錄音的轉錄文字，請將其整理為結構化會議紀錄、三層精煉心智圖與待辦清單：
-
-【會議主題】：${meetingTitle || "會議錄音轉錄"}
-【錄音轉錄文字】：
-${transcriptText}
-
-請以 JSON 格式回應，包含 sections, mindMapNodes (最多3層), todos：
-{
-  "transcript": "${transcriptText.slice(0, 500)}...",
-  "sections": [...],
-  "mindMapNodes": [...],
-  "todos": [...]
-}`;
-
-      const structureRes = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: structurePrompt,
-        config: {
-          responseMimeType: "application/json",
-        },
-      });
-
-      const parsed = JSON.parse(structureRes.text || "{}");
-      res.json({
-        success: true,
-        transcript: transcriptText,
-        data: parsed,
-      });
-    } catch (err: any) {
-      console.error("Error in /api/meeting/transcribe-file:", err);
-      res.status(500).json({
-        error: err?.message || "Failed to transcribe audio file",
-      });
     }
+    if (!res.destroyed) res.end();
+  });
+
+  app.use((error: any, _req: any, res: any, next: any) => {
+    if (error?.type === 'entity.too.large') return res.status(413).json({ error: '錄音檔超過 200 MB，請先壓縮或分段後再試' });
+    next(error);
   });
 
   // Upgrade HTTP connection to WebSocket only for /ws/live
@@ -724,356 +574,13 @@ ${transcriptText}
     }
   });
 
-  wss.on("connection", async (clientWs: WebSocket) => {
-    let activeLiveSession: any = null;
-    let isClosed = false;
-    let sessionRolloverCount = 0;
-    let lastAudioTime = 0;
-    let lastToolCallTime = Date.now();
-    let autoSyncTimer: NodeJS.Timeout | null = null;
-
-    const sendToClient = (payload: Record<string, unknown>) => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify(payload));
-      }
-    };
-
-    // Keepalive ping interval every 15 seconds to prevent Cloud Run / proxy timeouts
-    const pingInterval = setInterval(() => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        sendToClient({ type: "ping", time: Date.now() });
-      }
-    }, 15000);
-
-    // Watchdog: If audio is streaming but no tool call happened in 20s, auto-catalyze
-    autoSyncTimer = setInterval(() => {
-      if (isClosed || !activeLiveSession) return;
-      const now = Date.now();
-      if (now - lastAudioTime < 6000 && now - lastToolCallTime > 20000) {
-        try {
-          activeLiveSession.sendRealtimeInput({
-            text: "【自動催化排程】：請根據剛剛聽到的會議發言，立即呼叫 syncMeetingNotes、syncMindMapNodes（最多3~4個一級柱，同類事項收斂）與 syncTodoItems 同步更新畫面！",
-          });
-          lastToolCallTime = now;
-        } catch (e) {
-          console.warn("Failed to auto-nudge live session:", e);
-        }
-      }
-    }, 10000);
-
-    // Function to connect or roll-over Gemini 3.8 Live session
-    const connectGeminiLiveSession = async (contextSummary?: string) => {
-      try {
-        const ai = getGenAIClient();
-        const rolloverInstruction = contextSummary
-          ? `${SYSTEM_INSTRUCTION}\n\n【延續前段會議上下文摘要】：\n${contextSummary}`
-          : SYSTEM_INSTRUCTION;
-
-        const session = await ai.live.connect({
-          model: "gemini-3.8-live",
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
-            },
-            systemInstruction: rolloverInstruction,
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            tools: [
-              {
-                functionDeclarations: [
-                  syncMeetingNotesDeclaration,
-                  syncMindMapNodesDeclaration,
-                  syncTodoItemsDeclaration,
-                ],
-              },
-            ],
-          },
-          callbacks: {
-            onopen: () => {
-              sendToClient({
-                type: "session_status",
-                status: "connected",
-                model: "gemini-3.8-live",
-                rolloverCount: sessionRolloverCount,
-              });
-            },
-            onmessage: (message: LiveServerMessage) => {
-              try {
-                // 1. Handle input audio transcription (user's live speech)
-                const inputText =
-                  (message.serverContent as any)?.inputTranscription?.text;
-                if (inputText) {
-                  sendToClient({
-                    type: "input_transcription",
-                    text: inputText,
-                    timestamp: new Date().toLocaleTimeString("zh-TW", {
-                      hour12: false,
-                      hour: "2-digit",
-                      minute: "2-digit",
-                      second: "2-digit",
-                    }),
-                  });
-                }
-
-                // 2. Handle model turn complete
-                if (message.serverContent?.turnComplete) {
-                  sendToClient({
-                    type: "turn_complete",
-                  });
-                }
-
-                // 3. Handle model audio output (kept silent per user preference)
-                const audioData =
-                  message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-                if (audioData) {
-                  sendToClient({
-                    type: "model_audio",
-                    audio: audioData,
-                  });
-                }
-
-                // 4. Handle Tool Calls (Meeting Notes, Mind Map, To-Dos)
-                const toolCall = (message as any).toolCall;
-                if (toolCall?.functionCalls && Array.isArray(toolCall.functionCalls)) {
-                  const functionResponses: any[] = [];
-
-                  for (const call of toolCall.functionCalls) {
-                    lastToolCallTime = Date.now();
-                    sendToClient({
-                      type: "tool_call",
-                      toolName: call.name,
-                      args: call.args,
-                      callId: call.id,
-                      timestamp: new Date().toLocaleTimeString("zh-TW", {
-                        hour12: false,
-                        hour: "2-digit",
-                        minute: "2-digit",
-                        second: "2-digit",
-                      }),
-                    });
-
-                    functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { result: "ok", synced: true },
-                    });
-                  }
-
-                  // Acknowledge tool execution back to Gemini 3.8 Live session
-                  if (activeLiveSession && functionResponses.length > 0) {
-                    try {
-                      activeLiveSession.sendToolResponse({
-                        functionResponses,
-                      });
-                    } catch (toolRespErr) {
-                      console.warn("Error sending tool response:", toolRespErr);
-                    }
-                  }
-                }
-              } catch (innerErr: any) {
-                console.error("Error processing LiveServerMessage:", innerErr);
-              }
-            },
-            onerror: (err: any) => {
-              console.error("Gemini 3.8 Live session error:", err);
-              // Avoid tight infinite reconnect loop on fatal auth or policy error
-              if (!isClosed && clientWs.readyState === WebSocket.OPEN && sessionRolloverCount < 2) {
-                sessionRolloverCount++;
-                sendToClient({
-                  type: "session_rollover",
-                  message: "Gemini 3.8 Live 連線嘗試恢復中...",
-                });
-                setTimeout(() => {
-                  if (!isClosed) connectGeminiLiveSession();
-                }, 1000);
-              }
-            },
-            onclose: (closeEvent?: any) => {
-              const code = closeEvent?.code;
-              // If remote closed unexpectedly (but not auth error 1008) and recording is active
-              if (
-                !isClosed &&
-                clientWs.readyState === WebSocket.OPEN &&
-                code !== 1008 &&
-                sessionRolloverCount < 2
-              ) {
-                sessionRolloverCount++;
-                sendToClient({
-                  type: "session_rollover",
-                  message: "正在無縫延續即時語音 Session...",
-                });
-                setTimeout(() => {
-                  if (!isClosed) connectGeminiLiveSession();
-                }, 500);
-              } else if (!isClosed) {
-                activeLiveSession = null;
-                sendToClient({
-                  type: "session_status",
-                  status: "connected",
-                  mode: "speech_sync",
-                  message: "雙軌收音通道就緒 · 語音轉錄即時同步中",
-                });
-              }
-            },
-          },
-        });
-
-        activeLiveSession = session;
-      } catch (err: any) {
-        activeLiveSession = null;
-        console.error("Failed to initialize Gemini 3.8 Live session:", err);
-        sendToClient({
-          type: "session_status",
-          status: "connected",
-          mode: "speech_sync",
-          message: "收音通道已建立 · 支援本機即時逐字稿與結構化分析",
-        });
-      }
-    };
-
-    // Initialize first Gemini 3.8 Live session in background without blocking client message listener
-    connectGeminiLiveSession().catch((err) => {
-      console.warn("Initial live session setup error:", err);
-    });
-
-    clientWs.on("message", (rawData) => {
-      try {
-        const parsed = JSON.parse(rawData.toString());
-
-        // Heartbeat pong response
-        if (parsed.type === "pong") {
-          return;
-        }
-
-        // Manual live reconnect request
-        if (parsed.type === "reconnect_live") {
-          sessionRolloverCount = 0;
-          sendToClient({
-            type: "session_rollover",
-            message: "已收到強制重整連線要求，正在重新建立通道...",
-          });
-          if (activeLiveSession) {
-            try {
-              activeLiveSession.close();
-            } catch {
-              // ignore
-            }
-          }
-          connectGeminiLiveSession(parsed.contextSummary);
-          return;
-        }
-
-        if (isClosed) return;
-
-        // Stream 16kHz PCM audio chunk from browser microphone
-        if (parsed.type === "audio" && parsed.audio) {
-          lastAudioTime = Date.now();
-          if (activeLiveSession) {
-            try {
-              activeLiveSession.sendRealtimeInput({
-                audio: {
-                  data: parsed.audio,
-                  mimeType: "audio/pcm;rate=16000",
-                },
-              });
-            } catch {
-              // ignore
-            }
-          }
-        }
-
-        // Inject text or manual speech directly into Gemini 3.8 Live session and guarantee instant structuring
-        if (parsed.type === "text_input" && parsed.text) {
-          // 1. Immediately run smart structure engine to guarantee instant real-time UI updates
-          const structure = generateSmartStructureFromUtterance(parsed.text, parsed.speaker || "現場收音");
-          const nowTime = new Date().toLocaleTimeString("zh-TW", {
-            hour12: false,
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          });
-
-          // 1. Sync Meeting Notes
-          sendToClient({
-            type: "tool_call",
-            toolName: "syncMeetingNotes",
-            args: { sections: structure.sections },
-            timestamp: nowTime,
-            callId: `notes-${Date.now()}`,
-          });
-
-          // 2. Sync Mind Map Nodes (Strict 3-Tier structure)
-          sendToClient({
-            type: "tool_call",
-            toolName: "syncMindMapNodes",
-            args: { nodes: structure.nodes },
-            timestamp: nowTime,
-            callId: `map-${Date.now()}`,
-          });
-
-          // 3. Sync To-Do items if detected
-          if (structure.todos.length > 0) {
-            sendToClient({
-              type: "tool_call",
-              toolName: "syncTodoItems",
-              args: { todos: structure.todos },
-              timestamp: nowTime,
-              callId: `todo-${Date.now()}`,
-            });
-          }
-
-          // 2. Also forward to active Gemini 3.8 Live session if active for multi-turn conversational context
-          if (activeLiveSession) {
-            try {
-              activeLiveSession.sendRealtimeInput({
-                text: `【最新會議發言】${parsed.speaker ? `${parsed.speaker}：` : ""}${parsed.text}`,
-              });
-            } catch (liveTextErr) {
-              console.warn("Could not forward text to live session:", liveTextErr);
-            }
-          }
-        }
-
-        // Force structure synchronization prompt during live audio streaming
-        if (parsed.type === "nudge_sync") {
-          lastToolCallTime = 0; // reset so it can respond immediately
-          if (activeLiveSession) {
-            try {
-              activeLiveSession.sendRealtimeInput({
-                text: `【手動催化同步】：請根據剛剛聽到的全部發言與語意上下文，立即呼叫 syncMeetingNotes、syncMindMapNodes（保持3~4個核心主題柱架構）與 syncTodoItems 更新畫面上的會議重點、心智圖與待辦事項。`,
-              });
-            } catch {
-              // ignore
-            }
-          } else {
-            sendToClient({
-              type: "session_status",
-              status: "connected",
-              message: "即時狀態已同步",
-            });
-          }
-        }
-      } catch (parseErr) {
-        console.error("Invalid WebSocket message from client:", parseErr);
-      }
-    });
-
-    clientWs.on("close", () => {
-      isClosed = true;
-      clearInterval(pingInterval);
-      if (autoSyncTimer) {
-        clearInterval(autoSyncTimer);
-      }
-      if (activeLiveSession) {
-        try {
-          activeLiveSession.close();
-        } catch {
-          // ignore
-        }
-      }
-    });
-  });
+  wss.on("connection", client => attachLiveSession(client, {
+    getAI: getGenAIClient,
+    model: LIVE_MODEL,
+    textModel: TEXT_MODEL,
+    instruction: SYSTEM_INSTRUCTION,
+    declarations: [syncMeetingNotesDeclaration, syncMindMapNodesDeclaration, syncTodoItemsDeclaration],
+  }));
 
   // Mount Vite middleware in development or serve static build in production
   if (process.env.NODE_ENV !== "production") {
@@ -1090,7 +597,7 @@ ${transcriptText}
     });
   }
 
-  httpServer.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, process.env.HOST || "0.0.0.0", () => {
     console.log(`PulseNote Live server listening on http://0.0.0.0:${PORT}`);
   });
 }

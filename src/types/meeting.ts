@@ -45,6 +45,9 @@ export interface MeetingSession {
   todos: TodoItem[];
   backupAudioBlobUrl?: string;
   hasLocalBackup?: boolean;
+  sourceMeetingId?: string;
+  sourceRecordingName?: string;
+  recoveryStatus?: 'transcript_only' | 'complete';
 }
 
 export interface LiveToolSyncPayload {

@@ -14,7 +14,7 @@ export function createCleanInitialMeetingSession(): MeetingSession {
   });
 
   return {
-    id: `session-${Date.now()}`,
+    id: `session-${crypto.randomUUID()}`,
     title: `${dateStr} 即時會議`,
     createdAt: `${dateStr} ${timeStr}`,
     updatedAt: timeStr,

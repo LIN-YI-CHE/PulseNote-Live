@@ -32,6 +32,12 @@ export function generateMeetingMarkdown(session: MeetingSession): string {
   );
   lines.push('');
 
+  if (session.sourceRecordingName) {
+    lines.push(`來源錄音：${session.sourceRecordingName}`);
+    lines.push(`重建狀態：${session.recoveryStatus === 'complete' ? '已完成整理' : '逐字稿已保留，待重試整理'}`);
+    lines.push('');
+  }
+
   lines.push('## 一、結構化會議重點與決策');
   if (session.notes.length === 0) {
     lines.push('_尚無會議重點摘要_');

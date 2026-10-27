@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Mic,
   MicOff,
-  Play,
   FileDown,
   FolderClock,
   Plus,
@@ -31,6 +30,9 @@ import {
   ToolCallInspectorItem,
 } from './types/meeting';
 import { createCleanInitialMeetingSession } from './data/sampleMeetings';
+import { compactMindMap } from './utils/mindMap';
+import { saveAudioChunk, listRecordings, readRecording } from './utils/audioStorage';
+import { RecordingRecovery } from './components/RecordingRecovery';
 import { MindMapCanvas } from './components/MindMapCanvas';
 import { NotesColumn } from './components/NotesColumn';
 import { TodoColumn } from './components/TodoColumn';
@@ -99,16 +101,9 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          const valid = parsed.filter(
-            (s) =>
-              s &&
-              s.id &&
-              !s.id.startsWith('session-default-') &&
-              !s.title?.includes('跨部門產品與架構雙週例會')
-          );
-          if (valid.length > 0) {
-            return valid;
-          }
+          const valid = parsed.filter(s => s && typeof s.id === 'string' && !s.id.startsWith('session-default-') && !s.title?.includes('跨部門產品與架構雙週例會'));
+          if (valid.length !== parsed.length) localStorage.setItem(`${STORAGE_KEY}_legacy_backup`, saved);
+          if (valid.length) return valid.map(s => ({ ...s, backupAudioBlobUrl: undefined, hasLocalBackup: false }));
         }
       }
     } catch {
@@ -118,11 +113,13 @@ export default function App() {
   });
 
   const [activeSessionId, setActiveSessionId] = useState<string>(
-    () => sessions[0]?.id || 'session-initial'
+    () => sessions[0].id
   );
+  const [sessionsHydrated, setSessionsHydrated] = useState(false);
   const [showHistoryDrawer, setShowHistoryDrawer] = useState<boolean>(false);
   const [showInspectorDrawer, setShowInspectorDrawer] = useState<boolean>(false);
   const [showCatchUpModal, setShowCatchUpModal] = useState<boolean>(false);
+  const [showRecordingRecovery, setShowRecordingRecovery] = useState(false);
   const [showCorrectionModal, setShowCorrectionModal] = useState<boolean>(false);
   const [correctionInstruction, setCorrectionInstruction] = useState<string>('');
   const [isCorrecting, setIsCorrecting] = useState<boolean>(false);
@@ -142,7 +139,7 @@ export default function App() {
   // Gemini 3.8 Live WebSocket & Microphone state
   const [isLiveRecording, setIsLiveRecording] = useState<boolean>(false);
   const [wsStatus, setWsStatus] = useState<
-    'disconnected' | 'connecting' | 'connected'
+    'disconnected' | 'connecting' | 'connected' | 'degraded'
   >('disconnected');
   const [livePartialTranscript, setLivePartialTranscript] =
     useState<string>('');
@@ -151,6 +148,8 @@ export default function App() {
   const [lastToolSyncInfo, setLastToolSyncInfo] = useState<string>(
     '就緒 · 支援長會議無縫滾動連線'
   );
+  const [isStartingMic, setIsStartingMic] = useState(false);
+  const isStartingMicRef = useRef(false);
   const [isConvergingMindMap, setIsConvergingMindMap] = useState<boolean>(false);
   const [isConvergingNotes, setIsConvergingNotes] = useState<boolean>(false);
   const lastToolCallTimestampRef = useRef<number>(Date.now());
@@ -236,7 +235,32 @@ export default function App() {
 
   // Auto-sync client sessions to server storage so backend retains meeting data
   useEffect(() => {
-    if (sessions.length === 0) return;
+    let cancelled = false;
+    fetch('/api/sessions').then(async response => {
+      if (!response.ok) throw new Error('無法讀取伺服器會議歷史');
+      const result = await response.json();
+      if (!result.success || !Array.isArray(result.sessions)) throw new Error('會議歷史格式不正確');
+      if (cancelled) return;
+      setSessions(local => {
+        const merged = new Map<string, MeetingSession>();
+        for (const session of result.sessions) {
+          if (session && typeof session.id === 'string' && !session.id.startsWith('session-default-') &&
+            Array.isArray(session.transcripts) && Array.isArray(session.notes) && Array.isArray(session.todos) && Array.isArray(session.mindMapNodes)) {
+            merged.set(session.id, { ...session, backupAudioBlobUrl: undefined, hasLocalBackup: false });
+          }
+        }
+        for (const session of local) merged.set(session.id, session);
+        return [...merged.values()];
+      });
+      setSessionsHydrated(true);
+    }).catch(error => {
+      if (!cancelled) setErrorBanner(`${error.message}；目前保留瀏覽器本機紀錄，暫停覆寫伺服器資料。`);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!sessionsHydrated || sessions.length === 0) return;
     const timer = setTimeout(() => {
       fetch('/api/sessions/sync', {
         method: 'POST',
@@ -248,10 +272,12 @@ export default function App() {
       });
     }, 1500);
     return () => clearTimeout(timer);
-  }, [sessions]);
+  }, [sessions, sessionsHydrated]);
 
   // Local Audio Backup via MediaRecorder (Safety net for 60+ min meetings)
   const [backupAudioUrl, setBackupAudioUrl] = useState<string | null>(null);
+  const [backupAudioExtension, setBackupAudioExtension] = useState('webm');
+  const [isBackingUp, setIsBackingUp] = useState(false);
   const recordedChunksRef = useRef<Blob[]>([]);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 
@@ -260,14 +286,18 @@ export default function App() {
 
   // Refs for callbacks to avoid stale closures (per Live API Rules)
   const wsRef = useRef<WebSocket | null>(null);
+  const liveReadyRef = useRef(false);
+  const pendingConnectionRef = useRef<Promise<WebSocket> | null>(null);
+  const browserSpeechActiveRef = useRef(false);
+  const startBrowserRecognitionRef = useRef<(() => void) | null>(null);
+  const audioQueueRef = useRef<string[]>([]);
+  const sessionsRef = useRef(sessions);
+  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const liveRecognitionRef = useRef<any>(null);
-  const activeSpeechDetectedRef = useRef<boolean>(false);
-  const speechStartTimestampRef = useRef<number>(0);
-  const lastSoundTimeRef = useRef<number>(0);
-  const hasWebSpeechResultRef = useRef<boolean>(false);
+
   const activeSessionIdRef = useRef<string>(activeSessionId);
   const partialBufferRef = useRef<string>('');
   const interimSpeechBufferRef = useRef<string>('');
@@ -277,6 +307,20 @@ export default function App() {
   const speechLangRef = useRef<'zh-TW' | 'en-US'>('zh-TW');
   const timerRef = useRef<number | null>(null);
   const isRecordingRef = useRef<boolean>(false);
+
+  useEffect(() => () => {
+    isRecordingRef.current = false;
+    liveRecognitionRef.current?.abort();
+    voiceRecognitionRef.current?.abort();
+    if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop();
+    processorRef.current?.disconnect();
+    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
+    void audioCtxRef.current?.close();
+    wsRef.current?.close();
+    if (timerRef.current) window.clearInterval(timerRef.current);
+    if (interimCommitTimerRef.current) window.clearTimeout(interimCommitTimerRef.current);
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+  }, []);
 
   useEffect(() => {
     speechLangRef.current = speechLang;
@@ -337,7 +381,7 @@ export default function App() {
           s.id === targetId
             ? {
                 ...updater(s),
-                updatedAt: `2026-10-19 ${nowStr}`,
+                updatedAt: new Date().toLocaleString('sv-SE'),
               }
             : s
         )
@@ -394,7 +438,7 @@ export default function App() {
 
       if (toolName === 'syncMindMapNodes' && Array.isArray(args.nodes)) {
         updateActiveSession((prev) => {
-          const merged = [...prev.mindMapNodes];
+          const merged = args.replace ? [] : [...prev.mindMapNodes];
           for (const incoming of args.nodes) {
             if (!incoming || !incoming.label) continue;
             const normalizedParentId =
@@ -415,7 +459,7 @@ export default function App() {
               merged.push(nodeObj);
             }
           }
-          return { ...prev, mindMapNodes: merged };
+          return { ...prev, mindMapNodes: compactMindMap(merged) };
         });
         setLastToolSyncInfo(`已更新三層心智圖 (${timestamp})`);
       }
@@ -466,122 +510,133 @@ export default function App() {
     [updateActiveSession]
   );
 
-  // Ensure WebSocket connection with keepalive ping-pong and auto-reconnect
+  // Reuse a single connection attempt; report readiness only after upstream setup.
   const ensureLiveWebSocket = useCallback((): Promise<WebSocket> => {
-    return new Promise((resolve, reject) => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        resolve(wsRef.current);
-        return;
+    if (pendingConnectionRef.current) return pendingConnectionRef.current;
+    if (wsRef.current?.readyState === WebSocket.OPEN) return Promise.resolve(wsRef.current);
+    const sessionId = activeSessionIdRef.current;
+    setWsStatus('connecting');
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
+    wsRef.current = ws;
+    const current = () => wsRef.current === ws && activeSessionIdRef.current === sessionId;
+    const flushTranscript = () => {
+      const text = partialBufferRef.current.trim();
+      if (!text || !current()) return;
+      partialBufferRef.current = '';
+      setLivePartialTranscript('');
+      updateActiveSession(prev => ({ ...prev, transcripts: [...prev.transcripts, {
+        id: `tr-${crypto.randomUUID()}`, speaker: '現場收音', text,
+        timestamp: new Date().toLocaleTimeString('zh-TW', { hour12: false }), isFinal: true,
+      }] }));
+    };
+    const fallback = () => {
+      liveReadyRef.current = false;
+      setWsStatus('degraded');
+      audioQueueRef.current = [];
+      if (isRecordingRef.current && !browserSpeechActiveRef.current) {
+        browserSpeechActiveRef.current = true;
+        startBrowserRecognitionRef.current?.();
       }
-
-      setWsStatus('connecting');
-      setErrorBanner(null);
-
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
-      wsRef.current = ws;
-
-      const connectionTimeout = setTimeout(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          resolve(ws);
-        }
-      }, 4000);
-
-      ws.onopen = () => {
-        setWsStatus('connected');
-        clearTimeout(connectionTimeout);
-        resolve(ws);
+    };
+    const attempt = new Promise<WebSocket>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true; clearTimeout(timeout);
+        pendingConnectionRef.current = null;
+        if (error) reject(error); else resolve(ws);
       };
-
-      ws.onmessage = (event) => {
+      const timeout = window.setTimeout(() => {
+        if (!current()) return finish(new Error('會議已切換'));
+        fallback();
+        setErrorBanner('即時 AI 連線逾時；錄音備份持續中，正在嘗試瀏覽器備援辨識。');
+        if (ws.readyState === WebSocket.OPEN) finish();
+        else { ws.close(); finish(new Error('無法連線到會議伺服器')); }
+      }, 12000);
+      ws.onopen = () => {
+        const session = sessionsRef.current.find(s => s.id === sessionId);
+        ws.send(JSON.stringify({ type: 'session_start', nodes: session?.mindMapNodes || [],
+          context: JSON.stringify({ title: session?.title, notes: session?.notes, todos: session?.todos }),
+          transcript: session?.transcripts.map(t => `${t.speaker}：${t.text}`).join('\n') || '',
+        }));
+      };
+      ws.onmessage = event => {
+        if (!current()) return;
         try {
           const msg = JSON.parse(event.data);
-
-          // Handle server ping keepalive
-          if (msg.type === 'ping') {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'pong' }));
-            }
-            return;
-          }
-
-          if (msg.type === 'session_status' && msg.status === 'connected') {
-            clearTimeout(connectionTimeout);
-            setWsStatus('connected');
-            setLastToolSyncInfo(
-              msg.message ||
-                (msg.rolloverCount
-                  ? `連線已平滑延續 (第 ${msg.rolloverCount + 1} 階段)`
-                  : '即時連線就緒 · 語音傾聽中')
-            );
-            resolve(ws);
+          if (msg.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return; }
+          if (msg.type === 'session_status') {
+            if (msg.status === 'connected') {
+              const pendingBrowserText = interimSpeechBufferRef.current.trim();
+              if (pendingBrowserText) {
+                updateActiveSession(prev => ({ ...prev, transcripts: [...prev.transcripts, {
+                  id: `tr-${crypto.randomUUID()}`, speaker: '現場收音', text: pendingBrowserText,
+                  timestamp: new Date().toLocaleTimeString('zh-TW', { hour12: false }), isFinal: true,
+                }] }));
+                ws.send(JSON.stringify({ type: 'text_input', speaker: '現場收音', text: pendingBrowserText }));
+              }
+              browserSpeechActiveRef.current = false;
+              liveRecognitionRef.current?.abort();
+              liveRecognitionRef.current = null;
+              interimSpeechBufferRef.current = '';
+              liveReadyRef.current = true;
+              setWsStatus('connected'); setErrorBanner(null);
+              if (isRecordingRef.current) for (const audio of audioQueueRef.current.splice(0)) ws.send(JSON.stringify({ type: 'audio', audio }));
+              else audioQueueRef.current = [];
+              finish();
+            } else if (msg.status === 'degraded') { flushTranscript(); fallback(); finish(); }
+            else if (msg.status === 'connecting') { liveReadyRef.current = false; setWsStatus('connecting'); }
+            if (msg.message) setLastToolSyncInfo(msg.message);
           } else if (msg.type === 'session_rollover') {
-            setLastToolSyncInfo(msg.message || '連線自動無縫延續中...');
-          } else if (msg.type === 'input_transcription' && msg.text) {
+            liveReadyRef.current = false; setWsStatus('connecting');
+            setLastToolSyncInfo(msg.message || '即時服務正在延續連線…');
+          } else if (msg.type === 'input_transcription' && msg.text && !browserSpeechActiveRef.current) {
             partialBufferRef.current += msg.text;
             setLivePartialTranscript(partialBufferRef.current);
-          } else if (msg.type === 'turn_complete') {
-            if (partialBufferRef.current.trim()) {
-              const finalTxt = partialBufferRef.current.trim();
-              const nowTime = new Date().toLocaleTimeString('zh-TW', {
-                hour12: false,
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              });
-              updateActiveSession((prev) => ({
-                ...prev,
-                transcripts: [
-                  ...prev.transcripts,
-                  {
-                    id: `tr-${Date.now()}`,
-                    speaker: '現場收音',
-                    text: finalTxt,
-                    timestamp: nowTime,
-                    isFinal: true,
-                  },
-                ],
-              }));
-              partialBufferRef.current = '';
-              setLivePartialTranscript('');
-            }
-          } else if (msg.type === 'tool_call') {
-            handleLiveToolCall(
-              msg.toolName,
-              msg.args,
-              msg.timestamp,
-              msg.callId
-            );
-          } else if (msg.type === 'error') {
-            clearTimeout(connectionTimeout);
-            setErrorBanner(msg.message);
-            resolve(ws); // resolve so mic capture isn't blocked
-          }
-        } catch (err) {
-          console.error('Error parsing WS message:', err);
-        }
+          } else if (msg.type === 'turn_complete') { flushTranscript(); }
+          else if (msg.type === 'tool_call') handleLiveToolCall(msg.toolName, msg.args, msg.timestamp, msg.callId);
+          else if (msg.type === 'error') { setErrorBanner(msg.message); }
+        } catch (error) { console.error('Invalid live response:', error); }
       };
-
       ws.onerror = () => {
-        clearTimeout(connectionTimeout);
-        setWsStatus('disconnected');
-        resolve(ws); // don't reject so audio recording proceeds
+        if (current()) fallback();
+        finish(new Error('即時連線失敗，請檢查伺服器與網路。'));
       };
-
       ws.onclose = () => {
-        clearTimeout(connectionTimeout);
-        setWsStatus('disconnected');
-        if (isRecordingRef.current) {
-          setLastToolSyncInfo('連線嘗試重整（本機麥克風與語音辨識持續運作中）...');
-          setTimeout(() => {
-            if (isRecordingRef.current) {
-              ensureLiveWebSocket().catch(() => {});
-            }
-          }, 2000);
-        }
+        finish(new Error('即時連線已中斷'));
+        if (!current()) return;
+        flushTranscript(); fallback();
+        wsRef.current = null;
+        if (isRecordingRef.current) window.setTimeout(() => {
+          if (isRecordingRef.current && activeSessionIdRef.current === sessionId) ensureLiveWebSocket().catch(() => {});
+        }, 2000);
       };
     });
+    pendingConnectionRef.current = attempt;
+    return attempt;
   }, [handleLiveToolCall, updateActiveSession]);
+
+  // Late messages from the previous meeting must never mutate a new one.
+  useEffect(() => {
+    liveReadyRef.current = false;
+    pendingConnectionRef.current = null;
+    const old = wsRef.current; wsRef.current = null; old?.close();
+    audioQueueRef.current = []; partialBufferRef.current = ''; interimSpeechBufferRef.current = '';
+    setLivePartialTranscript(''); setWsStatus('disconnected');
+    setBackupAudioUrl(sessionsRef.current.find(s => s.id === activeSessionId)?.backupAudioBlobUrl || null);
+    let cancelled = false;
+    listRecordings(activeSessionId).then(async recordings => {
+      if (!recordings[0]) return;
+      const blob = await readRecording(recordings[0]);
+      if (cancelled) return;
+      const url = URL.createObjectURL(blob);
+      setBackupAudioUrl(url);
+      setBackupAudioExtension(blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm');
+      setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, backupAudioBlobUrl: url, hasLocalBackup: true } : s));
+    }).catch(error => console.warn('Could not restore local audio:', error));
+    return () => { cancelled = true; };
+  }, [activeSessionId]);
 
   // Centralized robust speech committer: writes to transcript list and triggers 3-column structuring
   const commitTranscriptAndStructure = useCallback(
@@ -622,8 +677,10 @@ export default function App() {
       }));
 
       // Send to backend to trigger instant structure updates (notes, mind map, todos)
+      const targetSessionId = activeSessionIdRef.current;
       ensureLiveWebSocket()
         .then((ws) => {
+          if (activeSessionIdRef.current !== targetSessionId || ws.readyState !== WebSocket.OPEN) return;
           setLastToolSyncInfo('Gemini 正在分析對話並即時生成心智圖與重點...');
           ws.send(
             JSON.stringify({
@@ -635,6 +692,7 @@ export default function App() {
         })
         .catch((err) => {
           console.error('Failed to send utterance to Live session:', err);
+          setErrorBanner('逐字稿已保留，但尚未送達 AI 整理服務。請恢復連線後重試。');
         });
     },
     [ensureLiveWebSocket, updateActiveSession]
@@ -642,11 +700,15 @@ export default function App() {
 
   // Start / Stop Live Microphone Audio Capture (with local MediaRecorder & SpeechRecognition)
   const handleToggleLiveMic = async () => {
+    if (isStartingMicRef.current) return;
     if (isLiveRecording) {
       // Stop recording
       setIsLiveRecording(false);
       isRecordingRef.current = false;
+      browserSpeechActiveRef.current = false;
+      audioQueueRef.current = [];
       setMicLevel(0);
+      setIsBackingUp(false);
 
       if (timerRef.current) {
         window.clearInterval(timerRef.current);
@@ -693,21 +755,34 @@ export default function App() {
       }
 
       // Flush remaining transcript and nudge final sync
-      const leftover = (interimSpeechBufferRef.current || partialBufferRef.current).trim();
+      const leftover = interimSpeechBufferRef.current.trim();
       if (leftover) {
         commitTranscriptAndStructure('現場收音', leftover);
       }
+      const liveLeftover = partialBufferRef.current.trim();
+      if (liveLeftover) {
+        partialBufferRef.current = '';
+        setLivePartialTranscript('');
+        updateActiveSession(prev => ({ ...prev, transcripts: [...prev.transcripts, {
+          id: `tr-${crypto.randomUUID()}`, speaker: '現場收音', text: liveLeftover,
+          timestamp: new Date().toLocaleTimeString('zh-TW', { hour12: false }), isFinal: true,
+        }] }));
+      }
 
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'audio_end' }));
         wsRef.current.send(JSON.stringify({ type: 'nudge_sync' }));
       }
       return;
     }
 
     // Phase 1: Request Microphone Access
+    isStartingMicRef.current = true;
+    setIsStartingMic(true);
     let stream: MediaStream;
     try {
       setErrorBanner(null);
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('麥克風需要 HTTPS 或 localhost 安全網址，以及瀏覽器麥克風權限');
       stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -739,13 +814,18 @@ export default function App() {
       ) {
         setErrorBanner('電腦未偵測到可用的麥克風輸入裝置，請檢查硬體連接。');
       } else {
-        setErrorBanner(`無法啟動麥克風（${micErr?.message || '未知錯誤'}）。您仍可點擊「速記補全」或「測試發言」繼續使用。`);
+        setErrorBanner(`無法啟動麥克風（${micErr?.message || '未知錯誤'}）。可使用「速記補全」或手動輸入發言。`);
       }
+      isStartingMicRef.current = false;
+      setIsStartingMic(false);
       return;
     }
 
     // Phase 2: Start Audio Processing & Local Backup & Recognition
     try {
+      // Mark capture active before starting callbacks that inspect this flag.
+      isRecordingRef.current = true;
+      setIsLiveRecording(true);
       // 1. AudioContext initialization with graceful sampleRate fallback and immediate resume
       const AudioContextClass =
         window.AudioContext || (window as any).webkitAudioContext;
@@ -790,34 +870,63 @@ export default function App() {
       };
       updateVolumeMeter();
 
+      // PCM16 mono at 16 kHz is the Live API input format. The silent output
+      // keeps the processing callback running without playing microphone feedback.
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+      processor.onaudioprocess = event => {
+        if (!isRecordingRef.current || browserSpeechActiveRef.current) return;
+        const audio = downsampleAndConvertToPcm16(event.inputBuffer.getChannelData(0), audioCtx.sampleRate);
+        const ws = wsRef.current;
+        if (liveReadyRef.current && ws?.readyState === WebSocket.OPEN) {
+          if (ws.bufferedAmount < 1024 * 1024) ws.send(JSON.stringify({ type: 'audio', audio }));
+          else setErrorBanner('網路傳送速度不足，部分即時音訊延遲；請保留本機錄音備份。');
+        } else {
+          if (audioQueueRef.current.length >= 320) {
+            audioQueueRef.current.shift();
+            setErrorBanner('AI 連線尚未恢復；先前音訊保留於錄音備份，請稍後補轉錄。');
+          }
+          audioQueueRef.current.push(audio);
+        }
+      };
+      source.connect(processor); processor.connect(silentGain);
+
       // 3. Local WebM Audio Backup via MediaRecorder
       try {
-        const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-          ? 'audio/webm;codecs=opus'
-          : 'audio/webm';
-        const recorder = new MediaRecorder(stream, { mimeType: mime });
-        recordedChunksRef.current = [];
+        const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(type => MediaRecorder.isTypeSupported(type));
+        const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+        const chunks: Blob[] = [];
+        const backupSessionId = activeSessionIdRef.current;
+        const recordingInfo = { id: crypto.randomUUID(), sessionId: backupSessionId, mimeType: recorder.mimeType, createdAt: new Date().toISOString() };
+        let chunkIndex = 0;
+        let saveQueue = Promise.resolve();
+        recordedChunksRef.current = chunks;
         recorder.ondataavailable = (e) => {
           if (e.data && e.data.size > 0) {
-            recordedChunksRef.current.push(e.data);
+            chunks.push(e.data);
+            const index = chunkIndex++;
+            saveQueue = saveQueue.then(() => saveAudioChunk(recordingInfo, index, e.data)).catch(() => {
+              setErrorBanner('瀏覽器本機錄音儲存失敗或空間不足，請停止後立即下載錄音備份，避免重新整理頁面。');
+            });
           }
         };
-        recorder.onstop = () => {
-          if (recordedChunksRef.current.length > 0) {
-            const blob = new Blob(recordedChunksRef.current, { type: mime });
+        recorder.onstop = async () => {
+          if (mediaRecorderRef.current === recorder) setIsBackingUp(false);
+          if (chunks.length > 0) {
+            const blob = new Blob(chunks, { type: recorder.mimeType });
             const url = URL.createObjectURL(blob);
-            setBackupAudioUrl(url);
-            updateActiveSession((prev) => ({
-              ...prev,
-              backupAudioBlobUrl: url,
-              hasLocalBackup: true,
-            }));
+            if (activeSessionIdRef.current === backupSessionId) setBackupAudioUrl(url);
+            setBackupAudioExtension(blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm');
+            setSessions(prev => prev.map(session => session.id === backupSessionId ? { ...session, backupAudioBlobUrl: url, hasLocalBackup: true } : session));
           }
+          await saveQueue;
         };
         recorder.start(1000); // 1-second chunks
         mediaRecorderRef.current = recorder;
+        setIsBackingUp(true);
       } catch (recErr) {
         console.warn('MediaRecorder not available or failed to start:', recErr);
+        setErrorBanner('此瀏覽器無法建立錄音備份；請使用支援錄音的 Chrome 或 Edge，或另行保存音訊。');
       }
 
       // 4. Browser Native Speech Recognition (Instant local transcription with fresh-instance loop)
@@ -826,12 +935,13 @@ export default function App() {
         (window as any).webkitSpeechRecognition;
 
       if (!SpeechRecognitionClass) {
-        setErrorBanner(
+        startBrowserRecognitionRef.current = () => setErrorBanner(
           '此瀏覽器不支援 Web Speech API。請使用最新版 Google Chrome 或 Microsoft Edge 開啟，即可獲得即時語音辨識功能。您亦可在逐字稿欄位手動輸入或貼上發言。'
         );
       } else {
+        let recognitionFailures = 0;
         const startRecognitionInstance = () => {
-          if (!isRecordingRef.current) return;
+          if (!isRecordingRef.current || !browserSpeechActiveRef.current) return;
           try {
             const recognition = new SpeechRecognitionClass();
             recognition.continuous = true;
@@ -844,6 +954,8 @@ export default function App() {
             };
 
             recognition.onresult = (event: any) => {
+              if (!browserSpeechActiveRef.current || !isRecordingRef.current) return;
+              recognitionFailures = 0;
               let interim = '';
               for (let i = event.resultIndex; i < event.results.length; ++i) {
                 const res = event.results[i];
@@ -864,17 +976,13 @@ export default function App() {
                 if (interimCommitTimerRef.current) {
                   window.clearTimeout(interimCommitTimerRef.current);
                 }
-                interimCommitTimerRef.current = window.setTimeout(() => {
-                  if (interimSpeechBufferRef.current.trim() && isRecordingRef.current) {
-                    const speechToCommit = interimSpeechBufferRef.current.trim();
-                    commitTranscriptAndStructure('現場收音', speechToCommit);
-                  }
-                }, 1000);
               }
             };
 
             recognition.onerror = (recErr: any) => {
               console.warn('SpeechRecognition event error:', recErr?.error);
+              recognitionFailures++;
+              if (['not-allowed', 'service-not-allowed', 'audio-capture'].includes(recErr?.error) || recognitionFailures >= 3) browserSpeechActiveRef.current = false;
               if (recErr?.error === 'not-allowed') {
                 setErrorBanner('瀏覽器麥克風語音辨識權限未開啟或被拒絕，請點擊網址列旁的網站設定將麥克風設為「允許」。');
               } else if (recErr?.error === 'audio-capture') {
@@ -885,16 +993,16 @@ export default function App() {
             };
 
             recognition.onend = () => {
-              if (interimSpeechBufferRef.current.trim()) {
+              if (browserSpeechActiveRef.current && interimSpeechBufferRef.current.trim()) {
                 commitTranscriptAndStructure('現場收音', interimSpeechBufferRef.current.trim());
               }
               // If user is still recording, instantiate a FRESH instance after 150ms!
-              if (isRecordingRef.current) {
+              if (isRecordingRef.current && browserSpeechActiveRef.current) {
                 window.setTimeout(() => {
                   if (isRecordingRef.current) {
                     startRecognitionInstance();
                   }
-                }, 150);
+                }, Math.min(500 * 2 ** recognitionFailures, 4000));
               }
             };
 
@@ -905,7 +1013,7 @@ export default function App() {
           }
         };
 
-        startRecognitionInstance();
+        startBrowserRecognitionRef.current = startRecognitionInstance;
       }
 
       setIsLiveRecording(true);
@@ -920,11 +1028,26 @@ export default function App() {
       }, 1000);
 
       // 5. Connect WebSocket in background without blocking mic capture
-      ensureLiveWebSocket().catch((err) => {
+      ensureLiveWebSocket().then(() => {
+        if (!liveReadyRef.current && isRecordingRef.current && !browserSpeechActiveRef.current) {
+          browserSpeechActiveRef.current = true;
+          startBrowserRecognitionRef.current?.();
+        }
+      }).catch((err) => {
         console.warn('Live WebSocket connect error (local capture active):', err);
+        setErrorBanner(err.message);
       });
     } catch (liveErr: any) {
       console.error('Audio initialization error:', liveErr);
+      liveRecognitionRef.current?.abort();
+      if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop();
+      processorRef.current?.disconnect();
+      processorRef.current = null;
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (timerRef.current) window.clearInterval(timerRef.current);
+      void audioCtxRef.current?.close();
+      audioCtxRef.current = null;
+      setIsBackingUp(false);
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
         mediaStreamRef.current = null;
@@ -934,25 +1057,14 @@ export default function App() {
       setErrorBanner(
         `麥克風音訊處理器啟動異常（${liveErr?.message || '未知錯誤'}）。請檢查瀏覽器安全性設定。`
       );
+    } finally {
+      isStartingMicRef.current = false;
+      setIsStartingMic(false);
     }
   };
 
-  // Inject a manual or simulated dialogue turn into Gemini 3.8 Live with streaming typing effect
   const handleSendUtteranceToLive = async (speaker: string, text: string) => {
-    // Stream live partial transcript first so user sees real-time typing effect
-    let charIdx = 0;
-    const step = Math.max(1, Math.floor(text.length / 15));
-    setLivePartialTranscript(text.slice(0, Math.min(step, text.length)));
-
-    const streamInterval = window.setInterval(() => {
-      charIdx += step;
-      if (charIdx >= text.length) {
-        window.clearInterval(streamInterval);
-        commitTranscriptAndStructure(speaker, text);
-      } else {
-        setLivePartialTranscript(text.slice(0, charIdx));
-      }
-    }, 30);
+    commitTranscriptAndStructure(speaker, text);
   };
 
   const handleDeleteTranscript = (id: string) => {
@@ -970,6 +1082,14 @@ export default function App() {
   };
 
   const handleResetCurrentSession = () => {
+    if (isRecordingRef.current || isStartingMicRef.current) {
+      setErrorBanner('請先停止收音，再清空或切換會議。');
+      return;
+    }
+    const oldSocket = wsRef.current; wsRef.current = null; oldSocket?.close();
+    pendingConnectionRef.current = null; liveReadyRef.current = false;
+    partialBufferRef.current = ''; interimSpeechBufferRef.current = ''; audioQueueRef.current = [];
+    setLivePartialTranscript(''); setWsStatus('disconnected');
     const nowTime = new Date().toLocaleTimeString('zh-TW', {
       hour12: false,
       hour: '2-digit',
@@ -1322,6 +1442,7 @@ export default function App() {
   };
 
   const handleCreateNewSession = () => {
+    if (isRecordingRef.current || isStartingMicRef.current) { setErrorBanner('請先停止收音，再建立新會議。'); return; }
     const newSession = createCleanInitialMeetingSession();
     setSessions((prev) => [newSession, ...prev]);
     setActiveSessionId(newSession.id);
@@ -1331,6 +1452,7 @@ export default function App() {
 
   const handleDeleteSession = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isRecordingRef.current || isStartingMicRef.current) return;
     if (sessions.length <= 1) return;
     const remaining = sessions.filter((s) => s.id !== id);
     setSessions(remaining);
@@ -1543,6 +1665,7 @@ export default function App() {
 
           <button
             onClick={handleToggleLiveMic}
+            disabled={isStartingMic}
             className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 shadow-xs ${
               isLiveRecording
                 ? 'bg-red-600 hover:bg-red-700 text-white'
@@ -1570,7 +1693,7 @@ export default function App() {
             ) : (
               <>
                 <Mic className="w-3.5 h-3.5" />
-                <span>開始即時收音</span>
+                <span>{isStartingMic ? '正在啟動麥克風…' : '開始即時收音'}</span>
               </>
             )}
           </button>
@@ -1682,17 +1805,17 @@ export default function App() {
           {backupAudioUrl ? (
             <a
               href={backupAudioUrl}
-              download={`${activeSession.title.replace(/\s+/g, '_')}_本機錄音備份.webm`}
+              download={`${activeSession.title.replace(/\s+/g, '_')}_本機錄音備份.${backupAudioExtension}`}
               className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors whitespace-nowrap shrink-0"
               title="下載剛才在瀏覽器本機錄下的完整音訊檔"
             >
               <Download className="w-3.5 h-3.5" />
               <span>錄音備份</span>
             </a>
-          ) : isLiveRecording ? (
+          ) : isBackingUp ? (
             <div className="hidden sm:flex items-center gap-1 text-[11px] text-emerald-700 font-medium px-2 py-0.5 bg-emerald-50/80 rounded border border-emerald-200/60">
               <ShieldCheck className="w-3.5 h-3.5" />
-              <span>雙重備份中</span>
+              <span>本機錄音備份中</span>
             </div>
           ) : null}
 
@@ -1717,15 +1840,23 @@ export default function App() {
               }
             >
               {wsStatus === 'connected'
-                ? 'Live 連線中'
+                ? 'AI 已連線'
                 : wsStatus === 'connecting'
                 ? '重連中...'
-                : '待命'}
+                : wsStatus === 'degraded' ? 'AI 未就緒・備援模式' : '待命'}
             </span>
           </div>
 
           {/* AI Assistance Buttons Group */}
           <div className="flex items-center gap-1 bg-slate-100/80 p-0.5 rounded-lg border border-slate-200/60">
+            <button
+              onClick={() => setShowRecordingRecovery(true)}
+              disabled={isLiveRecording || isStartingMic}
+              className="flex items-center gap-1 rounded-md border border-blue-200/80 bg-white px-2 py-1 text-xs font-medium text-blue-700 shadow-2xs hover:bg-blue-50 disabled:opacity-40"
+              title="選取本場錄音或電腦裡的音檔，重建逐字稿、會議紀錄、心智圖與待辦；請先停止收音"
+            >
+              <Upload className="h-3 w-3" /><span>錄音重建</span>
+            </button>
             {/* Conversational Error Correction Button */}
             <button
               onClick={() => setShowCorrectionModal(true)}
@@ -1846,6 +1977,10 @@ export default function App() {
                   <div
                     key={sess.id}
                     onClick={() => {
+                      if (isRecordingRef.current || isStartingMicRef.current) {
+                        setErrorBanner('請先停止收音，再切換會議。');
+                        return;
+                      }
                       setActiveSessionId(sess.id);
                       setShowHistoryDrawer(false);
                     }}
@@ -2098,6 +2233,15 @@ export default function App() {
           </aside>
         )}
       </div>
+
+      {showRecordingRecovery && <RecordingRecovery
+        session={activeSession}
+        onClose={() => setShowRecordingRecovery(false)}
+        onRecovered={recovered => {
+          setSessions(prev => prev.some(s => s.id === recovered.id) ? prev.map(s => s.id === recovered.id ? recovered : s) : [recovered, ...prev]);
+          setActiveSessionId(recovered.id);
+        }}
+      />}
 
       {/* Modal: Catch-up / Reconstruct Meeting from Notes or Speech */}
       {showCatchUpModal && (
