@@ -30,10 +30,7 @@ import {
   TodoItem,
   ToolCallInspectorItem,
 } from './types/meeting';
-import {
-  INITIAL_MEETING_SESSIONS,
-  SIMULATED_MEETING_SCRIPT,
-} from './data/sampleMeetings';
+import { createCleanInitialMeetingSession } from './data/sampleMeetings';
 import { MindMapCanvas } from './components/MindMapCanvas';
 import { NotesColumn } from './components/NotesColumn';
 import { TodoColumn } from './components/TodoColumn';
@@ -95,24 +92,33 @@ function downsampleAndConvertToPcm16(
 }
 
 export default function App() {
-  // Load persisted sessions from localStorage
+  // Load persisted sessions from localStorage (filtering out legacy mock templates)
   const [sessions, setSessions] = useState<MeetingSession[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed;
+          const valid = parsed.filter(
+            (s) =>
+              s &&
+              s.id &&
+              !s.id.startsWith('session-default-') &&
+              !s.title?.includes('跨部門產品與架構雙週例會')
+          );
+          if (valid.length > 0) {
+            return valid;
+          }
         }
       }
     } catch {
       // fallback
     }
-    return INITIAL_MEETING_SESSIONS;
+    return [createCleanInitialMeetingSession()];
   });
 
   const [activeSessionId, setActiveSessionId] = useState<string>(
-    () => sessions[0]?.id || INITIAL_MEETING_SESSIONS[0].id
+    () => sessions[0]?.id || 'session-initial'
   );
   const [showHistoryDrawer, setShowHistoryDrawer] = useState<boolean>(false);
   const [showInspectorDrawer, setShowInspectorDrawer] = useState<boolean>(false);
@@ -145,7 +151,6 @@ export default function App() {
   const [lastToolSyncInfo, setLastToolSyncInfo] = useState<string>(
     '就緒 · 支援長會議無縫滾動連線'
   );
-  const [simStepIndex, setSimStepIndex] = useState<number>(0);
   const [isConvergingMindMap, setIsConvergingMindMap] = useState<boolean>(false);
   const [isConvergingNotes, setIsConvergingNotes] = useState<boolean>(false);
   const lastToolCallTimestampRef = useRef<number>(Date.now());
@@ -259,13 +264,10 @@ export default function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const liveRecognitionRef = useRef<any>(null);
-  const micSilentTimerRef = useRef<number | null>(null);
-  const [isMicSilentWarning, setIsMicSilentWarning] = useState<boolean>(false);
   const activeSpeechDetectedRef = useRef<boolean>(false);
   const speechStartTimestampRef = useRef<number>(0);
   const lastSoundTimeRef = useRef<number>(0);
   const hasWebSpeechResultRef = useRef<boolean>(false);
-  const simStepIndexRef = useRef<number>(0);
   const activeSessionIdRef = useRef<string>(activeSessionId);
   const partialBufferRef = useRef<string>('');
   const interimSpeechBufferRef = useRef<string>('');
@@ -645,12 +647,6 @@ export default function App() {
       setIsLiveRecording(false);
       isRecordingRef.current = false;
       setMicLevel(0);
-      setIsMicSilentWarning(false);
-
-      if (micSilentTimerRef.current) {
-        window.clearTimeout(micSilentTimerRef.current);
-        micSilentTimerRef.current = null;
-      }
 
       if (timerRef.current) {
         window.clearInterval(timerRef.current);
@@ -712,7 +708,6 @@ export default function App() {
     let stream: MediaStream;
     try {
       setErrorBanner(null);
-      setIsMicSilentWarning(false);
       stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -778,7 +773,6 @@ export default function App() {
       analyser.connect(silentGain);
       silentGain.connect(audioCtx.destination);
 
-      let hasReceivedAudioSignal = false;
       const timeData = new Uint8Array(analyser.fftSize);
       const updateVolumeMeter = () => {
         if (!isRecordingRef.current) return;
@@ -792,10 +786,6 @@ export default function App() {
         const level = Math.min(100, Math.round(rms * 450));
         setMicLevel(level);
 
-        if (level > 2) {
-          hasReceivedAudioSignal = true;
-          setIsMicSilentWarning(false);
-        }
         animFrameRef.current = requestAnimationFrame(updateVolumeMeter);
       };
       updateVolumeMeter();
@@ -929,13 +919,6 @@ export default function App() {
         }));
       }, 1000);
 
-      // Warning check: if after 5 seconds still no audio signal picked up, show hint
-      micSilentTimerRef.current = window.setTimeout(() => {
-        if (isRecordingRef.current && !hasReceivedAudioSignal) {
-          setIsMicSilentWarning(true);
-        }
-      }, 5000);
-
       // 5. Connect WebSocket in background without blocking mic capture
       ensureLiveWebSocket().catch((err) => {
         console.warn('Live WebSocket connect error (local capture active):', err);
@@ -970,14 +953,6 @@ export default function App() {
         setLivePartialTranscript(text.slice(0, charIdx));
       }
     }, 30);
-  };
-
-  const handleInjectSimulatedTurn = () => {
-    const idx = simStepIndexRef.current % SIMULATED_MEETING_SCRIPT.length;
-    const turn = SIMULATED_MEETING_SCRIPT[idx];
-    simStepIndexRef.current++;
-    setSimStepIndex((prev) => prev + 1);
-    handleSendUtteranceToLive(turn.speaker, turn.text);
   };
 
   const handleDeleteTranscript = (id: string) => {
@@ -1347,34 +1322,9 @@ export default function App() {
   };
 
   const handleCreateNewSession = () => {
-    const now = new Date();
-    const dateStr = now.toISOString().slice(0, 10);
-    const timeStr = now.toLocaleTimeString('zh-TW', {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-    const newId = `session-${Date.now()}`;
-    const newSession: MeetingSession = {
-      id: newId,
-      title: `新會議紀錄 (${dateStr} ${timeStr})`,
-      createdAt: `${dateStr} ${timeStr}`,
-      updatedAt: `${dateStr} ${timeStr}`,
-      durationSeconds: 0,
-      transcripts: [],
-      notes: [],
-      mindMapNodes: [
-        {
-          id: 'root',
-          parentId: null,
-          label: '會議核心主題',
-          category: 'root',
-        },
-      ],
-      todos: [],
-    };
+    const newSession = createCleanInitialMeetingSession();
     setSessions((prev) => [newSession, ...prev]);
-    setActiveSessionId(newId);
+    setActiveSessionId(newSession.id);
     setBackupAudioUrl(null);
     setShowHistoryDrawer(false);
   };
@@ -1728,14 +1678,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Microphone silence warning hint */}
-          {isMicSilentWarning && isLiveRecording && (
-            <div className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-amber-800 bg-amber-50 border border-amber-300 rounded-md">
-              <AlertCircle className="w-3 h-3 text-amber-600 shrink-0" />
-              <span>未偵測到音量：請確認電腦麥克風未靜音或對麥克風說話測試</span>
-            </div>
-          )}
-
           {/* Local Audio Backup Status & Download Button */}
           {backupAudioUrl ? (
             <a
@@ -1824,16 +1766,6 @@ export default function App() {
             >
               <Trash2 className="w-3 h-3 text-slate-400 hover:text-red-600" />
               <span>清空重置</span>
-            </button>
-
-            {/* Optional Demo Speech Button */}
-            <button
-              onClick={handleInjectSimulatedTurn}
-              className="hidden md:flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-500 bg-slate-50 hover:bg-slate-100 border border-slate-200/70 rounded transition-colors whitespace-nowrap shrink-0"
-              title="僅供功能體驗測試，非真實會議發言"
-            >
-              <Play className="w-2.5 h-2.5 fill-current text-slate-400" />
-              <span>示範劇本 (僅體驗)</span>
             </button>
 
             <button

@@ -3,49 +3,35 @@
     "id": "session-1793068935721",
     "title": "新會議紀錄 (2026-10-27 10:42)",
     "createdAt": "2026-10-27 10:42",
-    "updatedAt": "2026-10-19 11:17",
-    "durationSeconds": 1910,
+    "updatedAt": "2026-10-19 11:53",
+    "durationSeconds": 3335,
     "transcripts": [
       {
-        "id": "tr-1793070092789-sxpb",
+        "id": "tr-1793072082920-hd81",
         "speaker": "現場收音",
-        "text": "ok so days good life",
-        "timestamp": "11:01:32",
+        "text": "亞",
+        "timestamp": "11:34:42",
         "isFinal": true
       },
       {
-        "id": "tr-1793070242020-j5nx",
+        "id": "tr-1793072087389-uvnz",
         "speaker": "現場收音",
-        "text": "OK",
-        "timestamp": "11:04:02",
+        "text": "we need you",
+        "timestamp": "11:34:47",
         "isFinal": true
       },
       {
-        "id": "tr-1793070493588-4yls",
+        "id": "tr-1793072089565-t8jy",
         "speaker": "現場收音",
-        "text": "water",
-        "timestamp": "11:08:13",
+        "text": "we need you baby box date hour",
+        "timestamp": "11:34:49",
         "isFinal": true
       },
       {
-        "id": "tr-1793070675672-maf9",
+        "id": "tr-1793072101097-nl6k",
         "speaker": "現場收音",
-        "text": "生醫生",
-        "timestamp": "11:11:15",
-        "isFinal": true
-      },
-      {
-        "id": "tr-1793070795580-5ju4",
-        "speaker": "現場收音",
-        "text": "OK",
-        "timestamp": "11:13:15",
-        "isFinal": true
-      },
-      {
-        "id": "tr-1793070928535-00tu",
-        "speaker": "現場收音",
-        "text": "壓一個字",
-        "timestamp": "11:15:28",
+        "text": "we need you make it out",
+        "timestamp": "11:35:01",
         "isFinal": true
       }
     ],
@@ -59,7 +45,7 @@
       }
     ],
     "todos": [],
-    "backupAudioBlobUrl": "blob:https://ais-dev-fcolr2rgscnbcxb7r3svxa-665118668259.asia-east1.run.app/a081796b-c3fc-4d91-abbd-1acd78c364ba",
+    "backupAudioBlobUrl": "blob:https://ais-dev-fcolr2rgscnbcxb7r3svxa-665118668259.asia-east1.run.app/6229735f-b990-4a2b-86bc-953e704eb344",
     "hasLocalBackup": true
   },
   {
@@ -8108,111 +8094,5 @@
       }
     ],
     "todos": []
-  },
-  {
-    "id": "session-default-1",
-    "title": "Q4 產品研發與 Gemini 3.8 Live 導入同步會議",
-    "createdAt": "2026-10-18 14:00",
-    "updatedAt": "2026-10-18 14:12",
-    "durationSeconds": 185,
-    "transcripts": [
-      {
-        "id": "tr-1",
-        "speaker": "產品總監 陳雅婷",
-        "text": "今天我們主要確認 Q4 產品路線圖，特別是即時語音會議工作台的核心架構與上線時程。",
-        "timestamp": "14:01:12",
-        "isFinal": true
-      },
-      {
-        "id": "tr-2",
-        "speaker": "首席架構師 林建宏",
-        "text": "我們已經完成 Gemini 3.8 Live 的雙向音訊串流驗證，使用 16kHz PCM 搭配 Function Calling 可以同步更新心智圖與待辦事項，且不會播放多餘語音干擾會議。",
-        "timestamp": "14:02:45",
-        "isFinal": true
-      }
-    ],
-    "notes": [
-      {
-        "id": "topic-1",
-        "topic": "01. 核心架構與即時語音技術選型",
-        "summary": "確立採用 Gemini 3.8 Live 模型作為即時聽寫與結構化引擎，透過 16kHz PCM 音訊串流與 Function Calling 同步輸出會議摘要、心智圖與行動清單。",
-        "keyDecisions": [
-          "預設採用「純聽寫與整理模式」，前端靜音 AI 語音輸出以避免干擾會議進行",
-          "心智圖與待辦事項透過 Live Session 工具呼叫即時增量更新"
-        ],
-        "updatedAt": "14:02:50"
-      }
-    ],
-    "mindMapNodes": [
-      {
-        "id": "root",
-        "parentId": null,
-        "label": "Q4 語音工作台計畫",
-        "category": "root",
-        "notes": "核心目標：零延遲即時會議紀錄、心智圖與待辦同步"
-      },
-      {
-        "id": "node-arch",
-        "parentId": "root",
-        "label": "Gemini 3.8 Live 架構",
-        "category": "topic"
-      },
-      {
-        "id": "node-arch-1",
-        "parentId": "node-arch",
-        "label": "16kHz PCM 即時串流",
-        "category": "detail"
-      },
-      {
-        "id": "node-arch-2",
-        "parentId": "node-arch",
-        "label": "Function Calling 結構化同步",
-        "category": "decision"
-      },
-      {
-        "id": "node-ui",
-        "parentId": "root",
-        "label": "三欄式高密度工作區",
-        "category": "topic"
-      },
-      {
-        "id": "node-ui-1",
-        "parentId": "node-ui",
-        "label": "即時逐字稿與章節摘要",
-        "category": "detail"
-      },
-      {
-        "id": "node-ui-2",
-        "parentId": "node-ui",
-        "label": "互動式 SVG 心智圖畫布",
-        "category": "decision"
-      },
-      {
-        "id": "node-action",
-        "parentId": "root",
-        "label": "近期關鍵交付項目",
-        "category": "action"
-      }
-    ],
-    "todos": [
-      {
-        "id": "todo-1",
-        "task": "完成雙向 WebSocket 音訊串流閘道器壓力測試報告",
-        "assignee": "林建宏",
-        "priority": "high",
-        "dueDate": "本週五",
-        "completed": false,
-        "createdAt": "14:02:10"
-      },
-      {
-        "id": "todo-2",
-        "task": "實作心智圖高解析度 PNG 與 Markdown 會議報告匯出功能",
-        "assignee": "前端團隊",
-        "priority": "medium",
-        "dueDate": "10/25",
-        "completed": true,
-        "createdAt": "14:03:00"
-      }
-    ]
   }
 ]

@@ -97,8 +97,21 @@
 ┌──────────────────────────────────────────▼───────────────────────────────────────┐
 │                         Express + WebSocket Server (Node.js)                     │
 │                                                                                  │
-│  ┌────────────────────────────────────────────────────────────────────────────┐  │
-│  │                     @google/genai Live Session Bridge                      │  │
+│## 5. Implementation Status & Progress
+
+- [x] **徹底刪除所有範本、範本模式與示範劇本**：
+  - 完全移除了 `SIMULATED_MEETING_SCRIPT` 模擬劇本與 `INITIAL_MEETING_SESSIONS` 預設會議。
+  - 移除了頂部工作列上的「示範劇本 (僅體驗)」按鈕。
+  - 清理後端 `data/saved_sessions.json` 與前端 `localStorage`，過濾並清除任何 `session-default-` 示範資料，進入系統時一律以乾淨的即時會議啟動。
+  - 移除逐字稿欄位的所有預設示範標籤，保留乾淨的對話發言輸入框。
+- [x] **修復麥克風硬體音量收音與消除「未偵測到音量」警示**：
+  - 將 Web Audio API 音訊圖完整串接至靜音目標節點（`source -> analyser -> silentGain(gain=0) -> destination`），驅動瀏覽器底層音訊硬體的拉取時鐘（Hardware Pull Clock），使 RMS 音量即時反應用戶真實發言。
+  - 完全移除誤報的 5 秒靜音警示橫幅與計時器，避免使用者瀏覽器麥克風已正常連線時頻繁跳出干擾訊息。
+- [x] **雙向可靠即時會議分析管道**：
+  - 瀏覽器原生語音辨識（Web Speech API）搭配自動重啟迴圈（Fresh-Instance Restart Loop），克服 Chrome 短暫連線中斷問題。
+  - 逐字稿底部的即時發言輸入與速記補全：即使處於企業內網或沙盒環境中 Web Speech 受阻，任何發言或筆記貼入輸入框即刻送入後端智慧解構，自動產出三層心智圖、核心重點與無假人名的待辦清單。
+- [x] **三欄排版優化與末端節點詳細資訊彈窗**：
+  - 心智圖與結構化章節獨立標題、左中右三欄寬度自由拖曳、心智圖葉節點點擊彈出詳細脈絡視窗並可一鍵轉為待辦事項。│  │                     @google/genai Live Session Bridge                      │  │
 │  │  • Model: "gemini-3.8-live"                                                │  │
 │  │  • Config: responseModalities: [AUDIO], inputAudioTranscription: {}        │  │
 │  │  • Tools: syncMeetingNotes, syncMindMapNodes, syncTodoItems                │  │
