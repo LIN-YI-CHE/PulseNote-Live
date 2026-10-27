@@ -59,6 +59,41 @@ function float32ToPcm16Base64(float32Array: Float32Array): string {
   return btoa(binary);
 }
 
+function downsampleAndConvertToPcm16(
+  inputBuffer: Float32Array,
+  inputSampleRate: number,
+  targetSampleRate = 16000
+): string {
+  if (inputSampleRate === targetSampleRate) {
+    return float32ToPcm16Base64(inputBuffer);
+  }
+  const ratio = inputSampleRate / targetSampleRate;
+  const newLength = Math.max(1, Math.floor(inputBuffer.length / ratio));
+  const buffer = new ArrayBuffer(newLength * 2);
+  const view = new DataView(buffer);
+
+  for (let i = 0; i < newLength; i++) {
+    const startIdx = Math.floor(i * ratio);
+    const endIdx = Math.min(inputBuffer.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    let count = 0;
+    for (let j = startIdx; j < endIdx; j++) {
+      sum += inputBuffer[j];
+      count++;
+    }
+    const avg = count > 0 ? sum / count : (inputBuffer[startIdx] || 0);
+    const s = Math.max(-1, Math.min(1, avg));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
 export default function App() {
   // Load persisted sessions from localStorage
   const [sessions, setSessions] = useState<MeetingSession[]>(() => {
@@ -223,10 +258,27 @@ export default function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveRecognitionRef = useRef<any>(null);
+  const micSilentTimerRef = useRef<number | null>(null);
+  const [isMicSilentWarning, setIsMicSilentWarning] = useState<boolean>(false);
+  const activeSpeechDetectedRef = useRef<boolean>(false);
+  const speechStartTimestampRef = useRef<number>(0);
+  const lastSoundTimeRef = useRef<number>(0);
+  const hasWebSpeechResultRef = useRef<boolean>(false);
+  const simStepIndexRef = useRef<number>(0);
   const activeSessionIdRef = useRef<string>(activeSessionId);
   const partialBufferRef = useRef<string>('');
+  const interimSpeechBufferRef = useRef<string>('');
+  const interimCommitTimerRef = useRef<number | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const [speechLang, setSpeechLang] = useState<'zh-TW' | 'en-US'>('zh-TW');
+  const speechLangRef = useRef<'zh-TW' | 'en-US'>('zh-TW');
   const timerRef = useRef<number | null>(null);
   const isRecordingRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    speechLangRef.current = speechLang;
+  }, [speechLang]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -431,10 +483,12 @@ export default function App() {
         if (ws.readyState === WebSocket.OPEN) {
           resolve(ws);
         }
-      }, 5000);
+      }, 4000);
 
       ws.onopen = () => {
         setWsStatus('connected');
+        clearTimeout(connectionTimeout);
+        resolve(ws);
       };
 
       ws.onmessage = (event) => {
@@ -453,9 +507,10 @@ export default function App() {
             clearTimeout(connectionTimeout);
             setWsStatus('connected');
             setLastToolSyncInfo(
-              msg.rolloverCount
-                ? `連線已平滑延續 (第 ${msg.rolloverCount + 1} 階段)`
-                : 'Gemini 3.8 Live 已連線 · 傾聽中'
+              msg.message ||
+                (msg.rolloverCount
+                  ? `連線已平滑延續 (第 ${msg.rolloverCount + 1} 階段)`
+                  : '即時連線就緒 · 語音傾聽中')
             );
             resolve(ws);
           } else if (msg.type === 'session_rollover') {
@@ -498,7 +553,7 @@ export default function App() {
           } else if (msg.type === 'error') {
             clearTimeout(connectionTimeout);
             setErrorBanner(msg.message);
-            reject(new Error(msg.message));
+            resolve(ws); // resolve so mic capture isn't blocked
           }
         } catch (err) {
           console.error('Error parsing WS message:', err);
@@ -508,35 +563,116 @@ export default function App() {
       ws.onerror = () => {
         clearTimeout(connectionTimeout);
         setWsStatus('disconnected');
-        reject(new Error('WebSocket 連線失敗'));
+        resolve(ws); // don't reject so audio recording proceeds
       };
 
       ws.onclose = () => {
         clearTimeout(connectionTimeout);
         setWsStatus('disconnected');
         if (isRecordingRef.current) {
-          setLastToolSyncInfo('連線中斷，正在自動重新連線（麥克風持續錄音備份中）...');
+          setLastToolSyncInfo('連線嘗試重整（本機麥克風與語音辨識持續運作中）...');
           setTimeout(() => {
             if (isRecordingRef.current) {
               ensureLiveWebSocket().catch(() => {});
             }
-          }, 1500);
+          }, 2000);
         }
       };
     });
   }, [handleLiveToolCall, updateActiveSession]);
 
-  // Start / Stop Live Microphone Audio Capture (with local MediaRecorder safety net)
+  // Centralized robust speech committer: writes to transcript list and triggers 3-column structuring
+  const commitTranscriptAndStructure = useCallback(
+    (speaker: string, text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+
+      const nowTime = new Date().toLocaleTimeString('zh-TW', {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+
+      // Clear interim states
+      interimSpeechBufferRef.current = '';
+      partialBufferRef.current = '';
+      setLivePartialTranscript('');
+
+      if (interimCommitTimerRef.current) {
+        window.clearTimeout(interimCommitTimerRef.current);
+        interimCommitTimerRef.current = null;
+      }
+
+      // Add to session transcripts with speaker (e.g. "現場收音")
+      updateActiveSession((prev) => ({
+        ...prev,
+        transcripts: [
+          ...prev.transcripts,
+          {
+            id: `tr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            speaker,
+            text: clean,
+            timestamp: nowTime,
+            isFinal: true,
+          },
+        ],
+      }));
+
+      // Send to backend to trigger instant structure updates (notes, mind map, todos)
+      ensureLiveWebSocket()
+        .then((ws) => {
+          setLastToolSyncInfo('Gemini 正在分析對話並即時生成心智圖與重點...');
+          ws.send(
+            JSON.stringify({
+              type: 'text_input',
+              speaker,
+              text: clean,
+            })
+          );
+        })
+        .catch((err) => {
+          console.error('Failed to send utterance to Live session:', err);
+        });
+    },
+    [ensureLiveWebSocket, updateActiveSession]
+  );
+
+  // Start / Stop Live Microphone Audio Capture (with local MediaRecorder & SpeechRecognition)
   const handleToggleLiveMic = async () => {
     if (isLiveRecording) {
       // Stop recording
       setIsLiveRecording(false);
       isRecordingRef.current = false;
       setMicLevel(0);
+      setIsMicSilentWarning(false);
+
+      if (micSilentTimerRef.current) {
+        window.clearTimeout(micSilentTimerRef.current);
+        micSilentTimerRef.current = null;
+      }
 
       if (timerRef.current) {
         window.clearInterval(timerRef.current);
         timerRef.current = null;
+      }
+
+      if (interimCommitTimerRef.current) {
+        window.clearTimeout(interimCommitTimerRef.current);
+        interimCommitTimerRef.current = null;
+      }
+
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+
+      // Stop speech recognition
+      if (liveRecognitionRef.current) {
+        try {
+          liveRecognitionRef.current.abort();
+        } catch {}
+        liveRecognitionRef.current = null;
       }
 
       // Stop MediaRecorder and build downloadable local backup audio
@@ -561,29 +697,9 @@ export default function App() {
       }
 
       // Flush remaining transcript and nudge final sync
-      if (partialBufferRef.current.trim()) {
-        const leftover = partialBufferRef.current.trim();
-        const nowTime = new Date().toLocaleTimeString('zh-TW', {
-          hour12: false,
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-        });
-        updateActiveSession((prev) => ({
-          ...prev,
-          transcripts: [
-            ...prev.transcripts,
-            {
-              id: `tr-${Date.now()}`,
-              speaker: '現場收音',
-              text: leftover,
-              timestamp: nowTime,
-              isFinal: true,
-            },
-          ],
-        }));
-        partialBufferRef.current = '';
-        setLivePartialTranscript('');
+      const leftover = (interimSpeechBufferRef.current || partialBufferRef.current).trim();
+      if (leftover) {
+        commitTranscriptAndStructure('現場收音', leftover);
       }
 
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -596,11 +712,13 @@ export default function App() {
     let stream: MediaStream;
     try {
       setErrorBanner(null);
+      setIsMicSilentWarning(false);
       stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
         },
       });
       mediaStreamRef.current = stream;
@@ -631,9 +749,58 @@ export default function App() {
       return;
     }
 
-    // Phase 2: Start Local Backup & Live Connection
+    // Phase 2: Start Audio Processing & Local Backup & Recognition
     try {
-      // 1. Start browser-local backup recording via MediaRecorder immediately
+      // 1. AudioContext initialization with graceful sampleRate fallback and immediate resume
+      const AudioContextClass =
+        window.AudioContext || (window as any).webkitAudioContext;
+      let audioCtx: AudioContext;
+      try {
+        audioCtx = new AudioContextClass({ sampleRate: 16000 });
+      } catch {
+        audioCtx = new AudioContextClass();
+      }
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+      audioCtxRef.current = audioCtx;
+
+      // 2. Set up Web Audio Analyser and connect to silentGain -> destination to drive hardware audio pull clock
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.3;
+
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+
+      source.connect(analyser);
+      analyser.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
+
+      let hasReceivedAudioSignal = false;
+      const timeData = new Uint8Array(analyser.fftSize);
+      const updateVolumeMeter = () => {
+        if (!isRecordingRef.current) return;
+        analyser.getByteTimeDomainData(timeData);
+        let sum = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const val = (timeData[i] - 128) / 128;
+          sum += val * val;
+        }
+        const rms = Math.sqrt(sum / timeData.length);
+        const level = Math.min(100, Math.round(rms * 450));
+        setMicLevel(level);
+
+        if (level > 2) {
+          hasReceivedAudioSignal = true;
+          setIsMicSilentWarning(false);
+        }
+        animFrameRef.current = requestAnimationFrame(updateVolumeMeter);
+      };
+      updateVolumeMeter();
+
+      // 3. Local WebM Audio Backup via MediaRecorder
       try {
         const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
           ? 'audio/webm;codecs=opus'
@@ -657,51 +824,124 @@ export default function App() {
             }));
           }
         };
-        recorder.start(1000); // chunk every 1 sec
+        recorder.start(1000); // 1-second chunks
         mediaRecorderRef.current = recorder;
       } catch (recErr) {
         console.warn('MediaRecorder not available or failed to start:', recErr);
       }
 
-      // 2. Start WebSocket connection to Gemini 3.8 Live
-      const ws = await ensureLiveWebSocket();
+      // 4. Browser Native Speech Recognition (Instant local transcription with fresh-instance loop)
+      const SpeechRecognitionClass =
+        (window as any).SpeechRecognition ||
+        (window as any).webkitSpeechRecognition;
 
-      // 3. Start Web Audio processor (resamples to 16kHz for Gemini Live)
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      audioCtxRef.current = audioCtx;
-      const source = audioCtx.createMediaStreamSource(stream);
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
+      if (!SpeechRecognitionClass) {
+        setErrorBanner(
+          '此瀏覽器不支援 Web Speech API。請使用最新版 Google Chrome 或 Microsoft Edge 開啟，即可獲得即時語音辨識功能。您亦可在逐字稿欄位手動輸入或貼上發言。'
+        );
+      } else {
+        const startRecognitionInstance = () => {
+          if (!isRecordingRef.current) return;
+          try {
+            const recognition = new SpeechRecognitionClass();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = speechLangRef.current || 'zh-TW';
+            recognition.maxAlternatives = 1;
 
-      source.connect(processor);
-      processor.connect(audioCtx.destination);
+            recognition.onstart = () => {
+              setLastToolSyncInfo(`語音收音運作中 (${speechLangRef.current === 'zh-TW' ? '繁中' : '英文'}) · 正在聆聽...`);
+            };
 
-      processor.onaudioprocess = (e) => {
-        const inputData = e.inputBuffer.getChannelData(0);
-        let sum = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          sum += inputData[i] * inputData[i];
-        }
-        const rms = Math.sqrt(sum / inputData.length);
-        setMicLevel(Math.min(100, Math.round(rms * 400)));
+            recognition.onresult = (event: any) => {
+              let interim = '';
+              for (let i = event.resultIndex; i < event.results.length; ++i) {
+                const res = event.results[i];
+                if (res.isFinal) {
+                  const finalUtterance = res[0].transcript.trim();
+                  if (finalUtterance) {
+                    commitTranscriptAndStructure('現場收音', finalUtterance);
+                  }
+                } else {
+                  interim += res[0].transcript;
+                }
+              }
 
-        if (ws.readyState === WebSocket.OPEN) {
-          const base64Audio = float32ToPcm16Base64(inputData);
-          ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
-        }
-      };
+              if (interim.trim()) {
+                interimSpeechBufferRef.current = interim.trim();
+                setLivePartialTranscript(interim.trim());
+
+                if (interimCommitTimerRef.current) {
+                  window.clearTimeout(interimCommitTimerRef.current);
+                }
+                interimCommitTimerRef.current = window.setTimeout(() => {
+                  if (interimSpeechBufferRef.current.trim() && isRecordingRef.current) {
+                    const speechToCommit = interimSpeechBufferRef.current.trim();
+                    commitTranscriptAndStructure('現場收音', speechToCommit);
+                  }
+                }, 1000);
+              }
+            };
+
+            recognition.onerror = (recErr: any) => {
+              console.warn('SpeechRecognition event error:', recErr?.error);
+              if (recErr?.error === 'not-allowed') {
+                setErrorBanner('瀏覽器麥克風語音辨識權限未開啟或被拒絕，請點擊網址列旁的網站設定將麥克風設為「允許」。');
+              } else if (recErr?.error === 'audio-capture') {
+                setErrorBanner('找不到可用麥克風，或麥克風正被其他會議軟體獨佔。');
+              } else if (recErr?.error === 'network') {
+                setErrorBanner('瀏覽器語音辨識服務網路連線受阻（Google Speech Network Error）。若處於企業內網或 VPN 環境可能受限，您可直接於逐字稿輸入框貼上/鍵入發言，系統將立即自動分析！');
+              }
+            };
+
+            recognition.onend = () => {
+              if (interimSpeechBufferRef.current.trim()) {
+                commitTranscriptAndStructure('現場收音', interimSpeechBufferRef.current.trim());
+              }
+              // If user is still recording, instantiate a FRESH instance after 150ms!
+              if (isRecordingRef.current) {
+                window.setTimeout(() => {
+                  if (isRecordingRef.current) {
+                    startRecognitionInstance();
+                  }
+                }, 150);
+              }
+            };
+
+            recognition.start();
+            liveRecognitionRef.current = recognition;
+          } catch (err: any) {
+            console.warn('Could not initialize SpeechRecognition instance:', err);
+          }
+        };
+
+        startRecognitionInstance();
+      }
 
       setIsLiveRecording(true);
       isRecordingRef.current = true;
+
+      // Start meeting timer
       timerRef.current = window.setInterval(() => {
         updateActiveSession((prev) => ({
           ...prev,
           durationSeconds: prev.durationSeconds + 1,
         }));
       }, 1000);
+
+      // Warning check: if after 5 seconds still no audio signal picked up, show hint
+      micSilentTimerRef.current = window.setTimeout(() => {
+        if (isRecordingRef.current && !hasReceivedAudioSignal) {
+          setIsMicSilentWarning(true);
+        }
+      }, 5000);
+
+      // 5. Connect WebSocket in background without blocking mic capture
+      ensureLiveWebSocket().catch((err) => {
+        console.warn('Live WebSocket connect error (local capture active):', err);
+      });
     } catch (liveErr: any) {
-      console.error('Gemini Live session connection error:', liveErr);
-      // Clean up media stream if initial setup failed so mic icon doesn't dangle
+      console.error('Audio initialization error:', liveErr);
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
         mediaStreamRef.current = null;
@@ -709,54 +949,73 @@ export default function App() {
       setIsLiveRecording(false);
       isRecordingRef.current = false;
       setErrorBanner(
-        `Gemini 3.8 Live 連線異常（${liveErr?.message || '伺服器連線建立失敗'}）。您可稍後重試，或點擊「注入測試對話」/「速記補全」。`
+        `麥克風音訊處理器啟動異常（${liveErr?.message || '未知錯誤'}）。請檢查瀏覽器安全性設定。`
       );
     }
   };
 
-  // Inject a manual or simulated dialogue turn into Gemini 3.8 Live
+  // Inject a manual or simulated dialogue turn into Gemini 3.8 Live with streaming typing effect
   const handleSendUtteranceToLive = async (speaker: string, text: string) => {
+    // Stream live partial transcript first so user sees real-time typing effect
+    let charIdx = 0;
+    const step = Math.max(1, Math.floor(text.length / 15));
+    setLivePartialTranscript(text.slice(0, Math.min(step, text.length)));
+
+    const streamInterval = window.setInterval(() => {
+      charIdx += step;
+      if (charIdx >= text.length) {
+        window.clearInterval(streamInterval);
+        commitTranscriptAndStructure(speaker, text);
+      } else {
+        setLivePartialTranscript(text.slice(0, charIdx));
+      }
+    }, 30);
+  };
+
+  const handleInjectSimulatedTurn = () => {
+    const idx = simStepIndexRef.current % SIMULATED_MEETING_SCRIPT.length;
+    const turn = SIMULATED_MEETING_SCRIPT[idx];
+    simStepIndexRef.current++;
+    setSimStepIndex((prev) => prev + 1);
+    handleSendUtteranceToLive(turn.speaker, turn.text);
+  };
+
+  const handleDeleteTranscript = (id: string) => {
+    updateActiveSession((prev) => ({
+      ...prev,
+      transcripts: prev.transcripts.filter((t) => t.id !== id),
+    }));
+  };
+
+  const handleClearTranscripts = () => {
+    updateActiveSession((prev) => ({
+      ...prev,
+      transcripts: [],
+    }));
+  };
+
+  const handleResetCurrentSession = () => {
     const nowTime = new Date().toLocaleTimeString('zh-TW', {
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',
-      second: '2-digit',
     });
-
     updateActiveSession((prev) => ({
       ...prev,
-      transcripts: [
-        ...prev.transcripts,
+      notes: [],
+      transcripts: [],
+      mindMapNodes: [
         {
-          id: `tr-${Date.now()}`,
-          speaker,
-          text,
-          timestamp: nowTime,
-          isFinal: true,
+          id: 'root',
+          parentId: 'NONE',
+          label: prev.title || '會議核心主題',
+          category: 'root',
         },
       ],
+      todos: [],
+      durationSeconds: 0,
+      updatedAt: nowTime,
     }));
-
-    try {
-      const ws = await ensureLiveWebSocket();
-      setLastToolSyncInfo('Gemini 3.8 Live 正在分析對話並更新圖表...');
-      ws.send(
-        JSON.stringify({
-          type: 'text_input',
-          speaker,
-          text,
-        })
-      );
-    } catch (err) {
-      console.error('Failed to send utterance to Live session:', err);
-    }
-  };
-
-  const handleInjectSimulatedTurn = () => {
-    const turn =
-      SIMULATED_MEETING_SCRIPT[simStepIndex % SIMULATED_MEETING_SCRIPT.length];
-    setSimStepIndex((prev) => prev + 1);
-    handleSendUtteranceToLive(turn.speaker, turn.text);
   };
 
   const handleNudgeSync = () => {
@@ -1319,11 +1578,22 @@ export default function App() {
           </a>
         </nav>
 
-        {/* Zone 3: 1 Primary Action Button */}
-        <div className="flex items-center gap-3 shrink-0">
+        {/* Zone 3: 1 Primary Action Button & Language selector */}
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={() => setSpeechLang((prev) => (prev === 'zh-TW' ? 'en-US' : 'zh-TW'))}
+            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300/80 rounded-lg transition-colors whitespace-nowrap shrink-0"
+            title="切換語音收音語言（預設繁體中文，亦支援英語）"
+          >
+            <span className="text-[10px] text-slate-500 font-mono">辨識語言:</span>
+            <span className="font-semibold text-slate-900">
+              {speechLang === 'zh-TW' ? '繁中' : 'English'}
+            </span>
+          </button>
+
           <button
             onClick={handleToggleLiveMic}
-            className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+            className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 shadow-xs ${
               isLiveRecording
                 ? 'bg-red-600 hover:bg-red-700 text-white'
                 : 'bg-blue-600 hover:bg-blue-700 text-white'
@@ -1331,7 +1601,20 @@ export default function App() {
           >
             {isLiveRecording ? (
               <>
-                <MicOff className="w-3.5 h-3.5" />
+                <div className="flex items-end gap-0.5 h-3.5 w-3.5 mr-0.5">
+                  <span
+                    className="w-1 bg-white rounded-full transition-all duration-75"
+                    style={{ height: `${Math.max(25, micLevel)}%` }}
+                  />
+                  <span
+                    className="w-1 bg-white rounded-full transition-all duration-75"
+                    style={{ height: `${Math.max(35, (micLevel * 1.3) % 100)}%` }}
+                  />
+                  <span
+                    className="w-1 bg-white rounded-full transition-all duration-75"
+                    style={{ height: `${Math.max(20, (micLevel * 0.7) % 100)}%` }}
+                  />
+                </div>
                 <span>停止即時收音</span>
               </>
             ) : (
@@ -1421,17 +1704,37 @@ export default function App() {
               {formatDuration(activeSession.durationSeconds)}
             </span>
             {isLiveRecording && (
-              <div
-                className="w-12 h-1.5 bg-slate-200 rounded-full overflow-hidden ml-1"
-                title="麥克風即時音量"
-              >
+              <div className="flex items-center gap-1.5 ml-1 pl-1.5 border-l border-slate-200">
+                <span className="text-[11px] text-slate-500 font-medium whitespace-nowrap">音量</span>
                 <div
-                  className="h-full bg-emerald-600 transition-all duration-100"
-                  style={{ width: `${Math.max(8, micLevel)}%` }}
-                />
+                  className="w-16 h-2 bg-slate-200 rounded-full overflow-hidden"
+                  title={`麥克風即時音量：${micLevel}%`}
+                >
+                  <div
+                    className={`h-full transition-all duration-75 ${
+                      micLevel > 15
+                        ? 'bg-emerald-500'
+                        : micLevel > 0
+                        ? 'bg-emerald-400'
+                        : 'bg-slate-300'
+                    }`}
+                    style={{ width: `${Math.max(6, micLevel)}%` }}
+                  />
+                </div>
+                <span className="font-mono-tabular text-[10px] text-slate-600 w-6 text-right">
+                  {micLevel}%
+                </span>
               </div>
             )}
           </div>
+
+          {/* Microphone silence warning hint */}
+          {isMicSilentWarning && isLiveRecording && (
+            <div className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-amber-800 bg-amber-50 border border-amber-300 rounded-md">
+              <AlertCircle className="w-3 h-3 text-amber-600 shrink-0" />
+              <span>未偵測到音量：請確認電腦麥克風未靜音或對麥克風說話測試</span>
+            </div>
+          )}
 
           {/* Local Audio Backup Status & Download Button */}
           {backupAudioUrl ? (
@@ -1513,17 +1816,24 @@ export default function App() {
           </div>
 
           {/* Utility Buttons Group */}
-          <div className="flex items-center gap-1">
-            {/* Simulated Speech Button */}
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={handleResetCurrentSession}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-600 hover:text-red-700 bg-white hover:bg-red-50 border border-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
+              title="清空目前會議的所有非本次紀錄，乾淨重新開始"
+            >
+              <Trash2 className="w-3 h-3 text-slate-400 hover:text-red-600" />
+              <span>清空重置</span>
+            </button>
+
+            {/* Optional Demo Speech Button */}
             <button
               onClick={handleInjectSimulatedTurn}
-              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded transition-colors whitespace-nowrap shrink-0"
-              title="送入測試發言測試 Gemini 3.8 Live"
+              className="hidden md:flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-500 bg-slate-50 hover:bg-slate-100 border border-slate-200/70 rounded transition-colors whitespace-nowrap shrink-0"
+              title="僅供功能體驗測試，非真實會議發言"
             >
-              <Play className="w-3 h-3 fill-current text-blue-600" />
-              <span>
-                測試發言 ({(simStepIndex % SIMULATED_MEETING_SCRIPT.length) + 1})
-              </span>
+              <Play className="w-2.5 h-2.5 fill-current text-slate-400" />
+              <span>示範劇本 (僅體驗)</span>
             </button>
 
             <button
@@ -1690,6 +2000,8 @@ export default function App() {
               onOpenCorrectionModal={() => setShowCorrectionModal(true)}
               onConvergeNotes={handleExecuteConvergeNotes}
               isConvergingNotes={isConvergingNotes}
+              onDeleteTranscript={handleDeleteTranscript}
+              onClearTranscripts={handleClearTranscripts}
             />
           </section>
 

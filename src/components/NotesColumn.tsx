@@ -29,6 +29,8 @@ interface NotesColumnProps {
   onOpenCorrectionModal?: () => void;
   onConvergeNotes?: () => Promise<void>;
   isConvergingNotes?: boolean;
+  onDeleteTranscript?: (id: string) => void;
+  onClearTranscripts?: () => void;
 }
 
 export const NotesColumn: React.FC<NotesColumnProps> = ({
@@ -43,6 +45,8 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
   onOpenCorrectionModal,
   onConvergeNotes,
   isConvergingNotes = false,
+  onDeleteTranscript,
+  onClearTranscripts,
 }) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTopic, setEditTopic] = useState('');
@@ -79,6 +83,13 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
       transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   }, [transcripts.length, livePartialTranscript, isTranscriptCollapsed]);
+
+  // Auto-expand transcript when incoming live speech is detected
+  useEffect(() => {
+    if (livePartialTranscript && isTranscriptCollapsed) {
+      setIsTranscriptCollapsed(false);
+    }
+  }, [livePartialTranscript, isTranscriptCollapsed]);
 
   const handleStartEdit = (sec: NoteSection) => {
     setEditingId(sec.id);
@@ -438,6 +449,17 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
               <span className="text-[11px] text-slate-500 whitespace-nowrap hidden sm:inline">
                 純聽寫靜音模式
               </span>
+              {transcripts.length > 0 && onClearTranscripts && (
+                <button
+                  type="button"
+                  onClick={onClearTranscripts}
+                  className="flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-slate-500 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded transition-colors whitespace-nowrap"
+                  title="清除當前逐字稿全部紀錄（避免無關測試發言干擾）"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>清空逐字稿</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={handleToggleTranscript}
@@ -456,18 +478,30 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
               <div className="py-6 text-center">
                 <MessageSquare className="w-5 h-5 text-slate-400 mx-auto mb-1.5" />
                 <p className="text-xs text-slate-500">
-                  等待麥克風語音輸入或測試對話注入...
+                  等待麥克風即時收音或在此輸入實際發言...
                 </p>
               </div>
             ) : (
               transcripts.map((tr) => (
-                <div key={tr.id} className="text-xs leading-relaxed">
-                  <div className="flex items-center gap-1.5 text-[11px] text-slate-500 mb-0.5">
-                    <span className="font-semibold text-slate-800">
-                      {tr.speaker}
-                    </span>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono-tabular">{tr.timestamp}</span>
+                <div key={tr.id} className="text-xs leading-relaxed group relative">
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 mb-0.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-semibold text-slate-800">
+                        {tr.speaker}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono-tabular">{tr.timestamp}</span>
+                    </div>
+                    {onDeleteTranscript && (
+                      <button
+                        type="button"
+                        onClick={() => onDeleteTranscript(tr.id)}
+                        className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-400 hover:text-red-600 transition-opacity rounded"
+                        title="刪除此行無關發言"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
                   </div>
                   <p className="text-slate-700 bg-white px-3 py-2 rounded border border-slate-200/80">
                     {tr.text}
@@ -478,15 +512,20 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
 
             {/* Live streaming partial transcription */}
             {livePartialTranscript && (
-              <div className="text-xs leading-relaxed">
-                <div className="flex items-center gap-1.5 text-[11px] text-blue-600 mb-0.5">
-                  <span className="font-semibold">即時收音辨識中</span>
+              <div className="text-xs leading-relaxed animate-in fade-in duration-150">
+                <div className="flex items-center gap-1.5 text-[11px] text-blue-600 mb-1">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-600"></span>
+                  </span>
+                  <span className="font-semibold text-blue-700">現場即時收音中</span>
                   <span aria-hidden="true">·</span>
-                  <span className="font-mono-tabular">LIVE</span>
+                  <span className="font-mono-tabular bg-blue-100 text-blue-700 text-[10px] px-1 py-0.2 rounded font-semibold">LIVE</span>
                 </div>
-                <p className="text-slate-900 bg-blue-50/70 px-3 py-2 rounded border border-blue-200">
-                  {livePartialTranscript}
-                </p>
+                <div className="text-slate-900 bg-blue-50/90 border border-blue-300/80 px-3 py-2 rounded shadow-2xs font-medium flex items-center">
+                  <span>{livePartialTranscript}</span>
+                  <span className="inline-block w-1.5 h-3.5 bg-blue-600 ml-1 animate-pulse" />
+                </div>
               </div>
             )}
             <div ref={transcriptEndRef} />
@@ -503,20 +542,20 @@ export const NotesColumn: React.FC<NotesColumnProps> = ({
               onChange={(e) => setSpeakerInput(e.target.value)}
               className="w-20 px-2 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded text-slate-700 focus:outline-none focus:border-blue-600 shrink-0"
               placeholder="發言人"
-              title="發言人名稱"
+              title="發言人名稱（如：客戶、業務、PM）"
             />
             <input
               type="text"
               value={utteranceInput}
               onChange={(e) => setUtteranceInput(e.target.value)}
               className="flex-1 min-w-0 px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded text-slate-900 focus:outline-none focus:border-blue-600"
-              placeholder="輸入會議發言並送入 Gemini 3.8 Live 測試..."
+              placeholder="輸入實際會議發言或口述要點送入分析..."
             />
             <button
               type="submit"
               disabled={!utteranceInput.trim()}
               className="p-1.5 text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-40 rounded transition-colors shrink-0"
-              title="傳送發言至 Gemini 3.8 Live"
+              title="送出發言"
             >
               <Send className="w-3.5 h-3.5" />
             </button>
